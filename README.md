@@ -12,7 +12,7 @@ self-contained PyTorch training notebook for Google Colab.
 
 ---
 
-## Gallery — torus (ours) vs supertoroid (ours)
+## Gallery — torus (based on Feng 26) vs supertoroid (ours)
 
 Each figure follows the paper's comparison layout — **top:** ground-truth surface and the two
 reconstructions (marching cubes of the blended SDF); **bottom:** a slice of the signed-distance
@@ -241,8 +241,6 @@ The method reimplemented here:
 > Signed Distance for Point Clouds.** *ACM Transactions on Graphics* 45, 4, Article 53 (July
 > 2026), 24 pages. <https://doi.org/10.1145/3811385>
 > Project page: <https://nzfeng.github.io/research/PointsAsTori/index.html>
-
-The full paper PDF (`PointsAsTori.pdf`) is included in the repository for reference.
 
 Data / assets used for evaluation (under their own terms, research use only): the **Stanford
 Bunny** (Stanford Computer Graphics Laboratory) and **ModelNet40** (Princeton). Visualization
