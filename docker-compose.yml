@@ -23,9 +23,12 @@ x-gpu: &gpu
 
 services:
   # Train BOTH a plain-torus and a supertoroid model on the same dataset (GPU).
+  # >=10k assets, >=5 epochs, per-epoch point/noise re-randomization (50% of points
+  # noiseless), and a 50/50 noisy/clean eval split. The dense cache is built inside
+  # the container (fast analytic sampling; no slow bind-mount mesh I/O).
   train:
     <<: *gpu
-    command: python train_gpu.py --epochs 40 --cache 4000 --modelnet 1500
+    command: python train_gpu.py --assets 10000 --epochs 6 --batch 12
 
   # Reconstruct meshes + render the torus-vs-supertoroid comparison figures
   # using the pretrained checkpoints in assets/ (this is "mesh generation").

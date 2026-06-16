@@ -104,7 +104,7 @@ def _render_slice(ax, sdf_fn, points, axis=2, value=0.0, extent=1.2, res=220,
 def render_comparison(shape, pats, points, out_path, *, slice_axis=2, slice_value=0.0,
                       recon_res=80, recon_bound=1.2, slice_extent=1.2, slice_res=220,
                       neighbors=64, view=(22, -62), suptitle=None, npoints_label=None,
-                      smooth_iters=12):
+                      smooth_iters=12, dpi=130):
     """Render a paper-style comparison and save it to ``out_path``.
 
     Args:
@@ -139,6 +139,6 @@ def render_comparison(shape, pats, points, out_path, *, slice_axis=2, slice_valu
     if suptitle:
         fig.suptitle(suptitle, fontsize=15, y=0.99)
     fig.subplots_adjust(left=0.01, right=0.99, top=0.93, bottom=0.02, wspace=0.05, hspace=0.02)
-    fig.savefig(out_path, dpi=130)
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     return out_path

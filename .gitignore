@@ -220,3 +220,10 @@ __marimo__/
 data/ModelNet40/
 
 *.zip
+
+# Points-as-(Super)Tori generated artifacts (keep assets/*.pt and assets/*.png)
+data/
+*.host.bak
+renders/*.pt
+renders/train.log
+_paper_text.txt

@@ -53,6 +53,12 @@ def load_bunny(normalize: bool = True) -> trimesh.Trimesh:
         pass
     if normalize:
         mesh = normalize_to_unit_cube(mesh)
+    # The OBJ is y-up (ears along +y); rotate +90 deg about x so the bunny stands
+    # upright with ears along +z, matching the renderer's z-up convention (so a view
+    # of the bunny shows its face and ears).  A 90 deg axis rotation just permutes the
+    # coordinates, so the unit-cube fit is preserved: (x, y, z) -> (x, -z, y).
+    v = mesh.vertices
+    mesh.vertices = np.stack([v[:, 0], -v[:, 2], v[:, 1]], axis=1)
     return mesh
 
 

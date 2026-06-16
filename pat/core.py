@@ -283,3 +283,24 @@ def blend(x, points, g_vals, C: float = 64.0):
     num = (w * g_vals).sum(dim=1)
     den = w.sum(dim=1).clamp_min(EPS)
     return num / den
+
+
+def blend_batched(x, points, g_vals, C: float = 64.0):
+    """Batched version of :func:`blend` for training many clouds at once on the GPU.
+
+    Args:
+        x:       query points ``(B, Q, 3)``.
+        points:  point-cloud positions ``(B, N, 3)``.
+        g_vals:  per-point signed values ``(B, Q, N)``.
+
+    Returns ``(B, Q)``.  Same self-normalized, dmin-stabilized formula as
+    :func:`blend`, vectorized over the leading cloud dimension ``B``.
+    """
+    d = torch.cdist(x, points)                       # (B, Q, N)
+    sigma = 0.5 * d.amax(dim=2, keepdim=True)        # (B, Q, 1)
+    lam = C / (sigma + EPS)
+    dmin = d.amin(dim=2, keepdim=True)
+    w = torch.exp(-lam * (d - dmin))
+    num = (w * g_vals).sum(dim=2)
+    den = w.sum(dim=2).clamp_min(EPS)
+    return num / den

@@ -27,9 +27,14 @@ docker compose run --rm train python -c "import torch; print('CUDA:', torch.cuda
 
 # 3) Train (writes assets/pat_torus.pt and assets/pat_supertoroid.pt via the bind mount):
 docker compose run --rm train
-#   override knobs, e.g. longer run / more real data:
-docker compose run --rm train python train_gpu.py --epochs 60 --cache 6000 --modelnet 3000 --log-every 200
+#   override knobs, e.g. more assets / epochs / bigger batch:
+docker compose run --rm train python train_gpu.py --assets 20000 --epochs 8 --batch 16
 ```
+
+The trainer uses **>=10k assets**, **>=5 epochs**, **per-epoch point + noise
+re-randomization** (a random 50% of each cloud's points are noised, re-rolled every
+epoch; the rest stay noiseless), and a **50/50 noisy/clean eval split**.  It is
+batched on the GPU (GPU kNN + batched blend) so the run is feasible on one laptop GPU.
 
 The bind mount in `docker-compose.yml` makes outputs land in the host `./assets` folder.
 

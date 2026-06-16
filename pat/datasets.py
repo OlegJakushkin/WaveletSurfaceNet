@@ -35,19 +35,28 @@ from .neighbors import knn_neighborhoods
 #  ModelNet40 index (written by the downloader; we only ever read it)
 # --------------------------------------------------------------------------- #
 def modelnet_index(root: str = "data") -> list[str]:
-    """Return the list of ``.off`` mesh paths from ``<root>/modelnet40_index.txt``.
+    """Return the list of ``.off`` mesh paths under ``<root>/ModelNet40``.
 
-    The index is produced asynchronously by the downloader (one path per line,
-    ~12311 lines once complete).  If it does not exist yet we return an empty
-    list rather than crashing, so a trainer can keep going on the bundled bunny
-    stand-in until the real data lands.
+    We walk the extracted ``ModelNet40`` directory directly so the paths are valid
+    regardless of where the dataset is mounted (this matters in Docker, where the
+    host paths in ``modelnet40_index.txt`` would be wrong).  If the directory is
+    absent we fall back to the cached index file, and finally to an empty list so
+    a trainer can keep going on the bundled stand-in until the real data lands.
     """
+    mn_dir = os.path.join(root, "ModelNet40")
+    if os.path.isdir(mn_dir):
+        paths = []
+        for dp, _, fs in os.walk(mn_dir):
+            paths.extend(os.path.join(dp, f) for f in fs if f.endswith(".off"))
+        if paths:
+            return sorted(paths)
     index_path = os.path.join(root, "modelnet40_index.txt")
-    if not os.path.isfile(index_path):
-        return []
-    with open(index_path, "r", encoding="utf-8") as fh:
-        paths = [line.strip() for line in fh if line.strip()]
-    return paths
+    if os.path.isfile(index_path):
+        with open(index_path, "r", encoding="utf-8") as fh:
+            cached = [line.strip() for line in fh if line.strip()]
+        if cached and all(os.path.isfile(p) for p in cached[:5]):
+            return cached
+    return []
 
 
 # --------------------------------------------------------------------------- #

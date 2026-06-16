@@ -6,7 +6,8 @@ Produces, in ``renders/``:
   * bunny.png          -- the Stanford bunny (complex traditional asset), 1024 pts
   * composite_noise.png-- box + cylinder boss + bored cylinder, sampled WITH noise
 
-Each figure has ground truth, "torus (ours)" and "supertoroid (ours)", in the paper's layout.
+Each figure has ground truth, "torus (based on Feng 26)" and "supertoroid (ours)", in the
+paper's layout.
 If a trained checkpoint is given (``--model``), the per-point coefficients (and the
 supertoroid's squareness) come from the network; otherwise they are optimized per cloud.
 """
@@ -22,6 +23,7 @@ import torch
 from pat import PAT
 from pat.assets import BoltPlate, Buckyball, BoxWithCylinders, Cube, TexturedCylinder
 from pat.bunny import bunny_shape
+from pat.shapes import Torus
 from pat.datasets import noisy_point_cloud
 from pat.model import CoeffNet
 from pat.optimize import fit_pair
@@ -62,7 +64,7 @@ def fit_models(shape, points, normals, *, model_t=None, model_s=None, model=None
         pat_t = PAT(points, normals, coeffs=pt.coeffs.numpy(), C=C)
         pat_s = PAT(points, normals, coeffs=ps.coeffs.numpy(), supertoroid=True,
                     p_tube=ps.p_tube.numpy(), p_ring=ps.p_ring.numpy(), C=C)
-    return {"torus (ours)": pat_t, "supertoroid (ours)": pat_s}
+    return {"torus (based on Feng 26)": pat_t, "supertoroid (ours)": pat_s}
 
 
 def main():
@@ -74,11 +76,15 @@ def main():
                     help="trained supertoroid checkpoint (used if it exists)")
     ap.add_argument("--points", type=int, default=1024)
     ap.add_argument("--noise", type=float, default=0.015, help="noise std for the composite")
-    ap.add_argument("--res", type=int, default=96)
+    ap.add_argument("--res", type=int, default=128)
+    ap.add_argument("--scale", type=float, default=2.0,
+                    help="output resolution multiplier (2.0 => 4x the pixels)")
     ap.add_argument("--fast", action="store_true",
                     help="least-squares torus + squareness-only supertoroid (quick)")
     ap.add_argument("--only", default=None, help="render only this asset name")
     args = ap.parse_args()
+    dpi = int(130 * args.scale)                  # 2.0 -> 260 dpi (4x pixels)
+    slice_res = int(220 * args.scale)
 
     def _load(path):
         if not path or not os.path.exists(path):
@@ -94,9 +100,10 @@ def main():
 
     rng = np.random.default_rng(0)
     assets = {
+        "torus": (Torus(0.6, 0.24), dict(smooth=12, C=16)),
         "buckyball": (Buckyball(), dict(smooth=8, C=14)),
         "cube": (Cube(), dict(smooth=10, C=18)),
-        "bunny": (bunny_shape(), dict(smooth=14, C=16)),
+        "bunny": (bunny_shape(), dict(smooth=14, C=16, view=(18, 210), slice_axis=0)),
         "composite_noise": (BoxWithCylinders(), dict(smooth=12, C=18, noisy=True)),
         "bolts": (BoltPlate(), dict(smooth=10, C=18)),
         "textured": (TexturedCylinder(), dict(smooth=4, C=22)),
@@ -116,7 +123,9 @@ def main():
         pats = fit_models(shape, pts, nrm, model=model, model_t=model_t,
                           model_s=model_s, C=opt["C"], fast=args.fast)
         render_comparison(shape, pats, pts, f"renders/{name}.png", recon_res=args.res,
-                          neighbors=96, npoints_label=label, smooth_iters=opt["smooth"])
+                          neighbors=96, npoints_label=label, smooth_iters=opt["smooth"],
+                          view=opt.get("view", (22, -62)), slice_axis=opt.get("slice_axis", 2),
+                          slice_res=slice_res, dpi=dpi)
         print(f"  saved renders/{name}.png", flush=True)
 
 
