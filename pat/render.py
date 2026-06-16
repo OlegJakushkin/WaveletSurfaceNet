@@ -27,12 +27,19 @@ _REDS = LinearSegmentedColormap.from_list(
     "pat_reds", [(1, 1, 1), (0.99, 0.86, 0.80), (0.94, 0.58, 0.46), (0.78, 0.18, 0.16)])
 
 
-def _mc(sdf_fn, res, bound, level=0.0):
-    """Marching cubes of an SDF callable over ``[-bound, bound]^3`` -> (verts, faces)."""
+def _mc(sdf_fn, res, bound, level=0.0, chunk=131072):
+    """Marching cubes of an SDF callable over ``[-bound, bound]^3`` -> (verts, faces).
+
+    The grid SDF is evaluated in chunks so a ground-truth callable that allocates per
+    query (e.g. the bunny's mesh SDF) doesn't blow up memory on a ``res^3`` grid.
+    """
     lin = np.linspace(-bound, bound, res)
     gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
     grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
-    vol = np.asarray(sdf_fn(grid)).reshape(res, res, res)
+    vol = np.empty(grid.shape[0], dtype=np.float32)
+    for a in range(0, len(grid), chunk):
+        vol[a:a + chunk] = np.asarray(sdf_fn(grid[a:a + chunk])).ravel()
+    vol = vol.reshape(res, res, res)
     if not (vol.min() < level < vol.max()):
         return None, None
     v, f, _, _ = measure.marching_cubes(vol, level=level)

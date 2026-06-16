@@ -34,46 +34,48 @@ Regenerate with `python make_renders.py` (uses the trained checkpoints in `asset
 
 ## What the method does
 
-Given a point cloud `P` with normals, *Points as Tori* (PAT) produces an **analytic,
-pointwise signed-distance function** to the underlying surface — no global solve, no
-spatial grid — by:
+Given a point cloud $P=\{\mathbf{p}_i\}_{i=1}^{|P|}$ with unit normals $\{\mathbf{n}_i\}$,
+*Points as Tori* (PAT) produces an **analytic, pointwise signed-distance function** $\phi$ to the
+underlying surface — no global solve, no spatial grid — by:
 
-1. **Fitting one torus per point** (precompute). A torus has a closed-form SDF and can
-   locally match any second-order surface (sphere, ellipsoid, saddle, cylinder, plane as
-   limits). The torus is determined from six polynomial coefficients of the local height
-   function via Monge-patch curvatures (paper Sec. 4.1 + Appendix C).
-2. **Blending** the per-point signed torus functions with a self-normalized,
-   exponentially-weighted average (Eq. 1 / Eq. 25), with the screening parameter
-   `λ` chosen automatically per query from machine precision (Eq. 26):
+1. **Fitting one torus per point** (precompute). A torus has a closed-form SDF and can locally
+   match any second-order surface (sphere, ellipsoid, saddle, cylinder, plane as limits). It is
+   determined from six polynomial coefficients of the local height function via Monge-patch
+   curvatures (paper Sec. 4.1 + App. C). The signed per-point function is
+   $g_i = \operatorname{sign}(T_i)\,\phi_{T_i}$.
+2. **Blending** the $g_i$ with a self-normalized, exponentially-weighted average (Eq. 1 / Eq. 25),
+   where the shift $\sigma_{\mathbf{x}}$ and screening $\lambda_{\mathbf{x}}$ are chosen
+   automatically per query from machine precision (Eq. 26).
 
-   ```
-   φ(x) = Σ_i g_i(x) e^(−λ_x(‖x−p_i‖−σ_x))  /  Σ_i e^(−λ_x(‖x−p_i‖−σ_x))
-   ```
+The torus SDF (Eq. 23, with center $\mathbf{c}$, axis $\mathbf{u}$, major radius $R$, minor radius
+$r$) and the blend are
 
-The six coefficients are produced either by **least squares** (training-free, the default
-— works great on clean data, brittle on curved/real data exactly as the paper's Fig. 3
-shows) or by a small **Transformer** trained once and reused across shapes (Sec. 4.3).
+$$\phi_T(\mathbf{x}) = \Big\lVert\big(\,\lVert(\mathbf{x}-\mathbf{c})\times\mathbf{u}\rVert - R,\ \ \langle\mathbf{x}-\mathbf{c},\,\mathbf{u}\rangle\,\big)\Big\rVert - r$$
+
+$$\phi(\mathbf{x}) = \frac{\displaystyle\sum_{i=1}^{|P|} g_i(\mathbf{x})\, e^{-\lambda_{\mathbf{x}}\left(\lVert\mathbf{x}-\mathbf{p}_i\rVert-\sigma_{\mathbf{x}}\right)}}{\displaystyle\sum_{i=1}^{|P|} e^{-\lambda_{\mathbf{x}}\left(\lVert\mathbf{x}-\mathbf{p}_i\rVert-\sigma_{\mathbf{x}}\right)}}, \qquad \sigma_{\mathbf{x}}=\tfrac{1}{2}\max_i\lVert\mathbf{x}-\mathbf{p}_i\rVert, \qquad \lambda_{\mathbf{x}}=\frac{C}{\sigma_{\mathbf{x}}},\quad C=64$$
+
+The six coefficients are produced either by **least squares** (training-free, the default — works
+great on clean data, brittle on curved/real data exactly as the paper's Fig. 3 shows) or by a
+small **Transformer** trained once and reused across shapes (Sec. 4.3).
 
 ### The supertoroid extension (this repo's addition)
 
-The paper uses ordinary tori, whose ring and tube cross-sections are **circles**. We
-generalize each cross-section to an **L^p super-ellipse** with two squareness exponents
-`p_tube`, `p_ring`:
+The paper uses ordinary tori, whose ring and tube cross-sections are **circles**. We generalize
+each cross-section to an $L^p$ **super-ellipse** with two squareness exponents
+$p_{\text{ring}}, p_{\text{tube}}$. With the $L^p$ norm
+$\lVert(x,y)\rVert_p = \big(|x|^p+|y|^p\big)^{1/p}$, the in-plane coordinates $(a,b)$ (in the plane
+$\perp\mathbf{u}$) and the axial coordinate $z_{\!\parallel}=\langle\mathbf{x}-\mathbf{c},\mathbf{u}\rangle$:
 
-```
-ring_radius = ‖(a, b)‖_{p_ring}        # super-ellipse in the plane ⟂ axis
-φ_super(x)  = ‖(ring_radius − R, axial)‖_{p_tube} − r
-```
+$$\rho = \big\lVert(a,b)\big\rVert_{p_{\text{ring}}}, \qquad \phi_{\text{super}}(\mathbf{x}) = \big\lVert(\rho - R,\ z_{\!\parallel})\big\rVert_{p_{\text{tube}}} - r$$
 
-* `p = 2` reproduces the paper's torus **exactly** — the torus is a strict special case,
-  so a trained torus model is contained in the supertoroid model.
-* `p > 2` gives boxy, rounded-square cross-sections that an ordinary torus cannot
-  represent. These help on shapes with flat faces / boxy edges, where a circular tube
-  cannot sit flush.
+* $p=2$ reproduces the paper's torus **exactly** — the torus is a strict special case, so a
+  trained torus model is contained in the supertoroid model.
+* $p>2$ gives boxy, rounded-square cross-sections that an ordinary torus cannot represent. These
+  help on shapes with flat faces / boxy edges, where a circular tube cannot sit flush.
 
-This is an *approximate* radial SDF for `p ≠ 2` (exact at `p = 2`), which is all the
-blending framework — itself an approximation — needs. It is fully differentiable, so the
-squareness can be learned/optimized alongside the coefficients.
+This is an *approximate* radial SDF for $p\neq 2$ (exact at $p=2$), which is all the blending
+framework — itself an approximation — needs. It is fully differentiable, so the squareness can be
+learned/optimized alongside the coefficients.
 
 ---
 
@@ -190,6 +192,23 @@ shared dataset** that deliberately explores the supertoroid's extra subsurfaces 
 with a wide range of squareness, plus the sharp/faceted cube, knurled cylinder and bolt plate),
 mixed with **noisy ModelNet40** real models (the ≥10,000-model set), all with input noise.
 
+### How the loss is computed (Eq. 27)
+
+For a batch of clouds with $Q$ query points $\mathbf{q}_j$ each, the predicted blended SDF $\phi$
+is fit to the ground-truth distance $\phi_{\text{true}}$ — distance to the **clean** surface, even
+though the input cloud is noisy — with an $L_1$ term, plus an **eikonal** term that pushes the
+field's gradient to unit norm (a true SDF satisfies $\lVert\nabla\phi\rVert=1$). The spatial
+gradient $\nabla_{\mathbf{x}}\phi$ is taken by autograd *through* the blend, so the eikonal term is
+differentiable in the network weights:
+
+$$\mathcal{L} = \mathcal{L}_{\text{dist}} + \beta\,\mathcal{L}_{\text{eik}}, \qquad \mathcal{L}_{\text{dist}} = \frac{1}{Q}\sum_{j=1}^{Q}\big|\,\phi(\mathbf{q}_j) - \phi_{\text{true}}(\mathbf{q}_j)\,\big|, \qquad \mathcal{L}_{\text{eik}} = \frac{1}{Q}\sum_{j=1}^{Q}\Big|\,1 - \big\lVert\nabla_{\mathbf{x}}\phi(\mathbf{q}_j)\big\rVert\,\Big|$$
+
+with $\beta = 0.1$. The reduction is a mean over **all** $B\times Q$ queries in the batch (clouds
+$\times$ queries). The plain-torus and supertoroid networks each minimize $\mathcal{L}$ on the
+*same* batch with their **own** AdamW optimizer (one `backward()` + step per network per batch; no
+gradient accumulation across batches), and any non-finite step is skipped so a degenerate batch
+cannot NaN-poison the weights.
+
 ```bash
 docker compose build
 docker compose run --rm train     # -> assets/pat_torus.pt, assets/pat_supertoroid.pt
@@ -197,11 +216,33 @@ docker compose run --rm render    # regenerate the comparison figures with the t
 docker compose run --rm test      # run the test suite (incl. the torus-reconstruction check)
 ```
 
-Live progress is logged per step (running loss, it/s, ETA) and per epoch (mean loss + the
-**val-torus-err**, the mean abs SDF error reconstructing a default torus). The acceptance bar is
-**val-torus-err < 0.01 for both models** — small enough that the default-torus reconstruction
-error is invisible by eye (`tests/test_validation.py`). The shared real-data pipeline lives in
-`pat/datasets.py` (`modelnet_index`, `noisy_point_cloud`, `make_training_example`).
+Live progress is logged per step (running loss, it/s, ETA) and per epoch — the **val-torus-err**
+and **val-cube-err** (mean abs SDF error reconstructing a default torus and a sharp flat-sided
+cube) plus the 50/50 clean/noisy held-out eval. The acceptance bar is **val-torus-err < 0.01 for
+both models** — small enough that the default-torus reconstruction error is invisible by eye
+(`tests/test_validation.py`). The real-data pipeline lives in `pat/datasets.py`.
+
+### Reading the training curves (`assets/training_curves.png`)
+
+Training writes `assets/training_curves.png` (regenerated each run; **left:** reconstruct a default
+torus / sharp cube — **right:** held-out 50% clean / 50% noisy eval):
+
+![training curves](assets/training_curves.png)
+
+Two implications to read off it:
+
+* **The plain torus overfits; the supertoroid does not.** On boxy data (CAD parts + the cube /
+  knurl / bolt + $p\neq 2$ supertoroids) the torus is stuck at $p=2$, so it can only push training
+  loss down by **contorting its curvature coefficients** to fake flat/boxy regions — which does not
+  generalize, so its val/eval curves bend **back up** after a couple of epochs. The supertoroid has
+  the matching squareness DOF, fits the boxy data honestly, and keeps improving — **its extra
+  expressiveness doubles as regularization.** We further curb the torus with **weight decay +
+  dropout** and ship the **best-by-val** epoch (early stopping), so the *saved* model is the
+  pre-overfit one even when the last epoch is worse.
+* **The cube is where the supertoroid wins most.** `val-cube-err` is consistently lower for the
+  supertoroid: a circular tube cannot sit flush against a flat face, a rounded-square one can. On
+  the round torus and on the clean/noisy eval the two are close; the gap opens on **sharp / flat**
+  geometry — which is the whole point of the extension.
 
 The Colab notebook `notebooks/train_pat_colab.ipynb` mirrors this for a hosted GPU (with a
 `DATA_MODE = 'synthetic' | 'modelnet'` switch) and saves a plain `state_dict` + config.
@@ -225,8 +266,8 @@ pat = PAT(points, normals, model=model)
 * The torus SDF and the blend are exact (validated to ~1e-7 against analytic SDFs). The
   accuracy bottleneck of the training-free path is **curvature estimation** from least
   squares — precisely the brittleness the paper motivates learning to fix (Fig. 3).
-* The supertoroid SDF is an exact distance only at `p = 2`; for `p ≠ 2` it is the standard
-  radial L^p approximation, smooth and differentiable.
+* The supertoroid SDF is an exact distance only at $p=2$; for $p\neq 2$ it is the standard
+  radial $L^p$ approximation, smooth and differentiable.
 * This is a research-grade reimplementation focused on the core method, the supertoroid
   extension, tests and training — not the paper's optimized C++/JAX inference, large-scale
   data pipeline, or the full evaluation against SPSR/NN-VIPSS/SHM.

@@ -23,6 +23,8 @@ from .neighbors import knn_neighborhoods, neighborhood_features, rescale_coeffs
 
 
 def _to_t(x, device="cpu"):
+    if torch.is_tensor(x):                       # e.g. coeffs straight off a GPU model
+        return x.to(device=device, dtype=torch.float32)
     return torch.as_tensor(np.asarray(x), dtype=torch.float32, device=device)
 
 
@@ -72,7 +74,7 @@ class PAT:
     # ------------------------------------------------------------------ #
     def _run_model(self, model, k):
         idx = knn_neighborhoods(self.points.cpu().numpy(), k)
-        nb = torch.as_tensor(idx, dtype=torch.long)
+        nb = torch.as_tensor(idx, dtype=torch.long, device=self.device)   # index on-device
         nbr_pos = self.points[nb]
         nbr_nrm = self.normals[nb]
         model.eval()

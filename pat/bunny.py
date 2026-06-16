@@ -222,21 +222,26 @@ class MeshShape(Shape):
         sign = np.where(wn > 0.5, -1.0, 1.0)                        # inside -> negative
         return sign * dist
 
-    def sdf(self, x: np.ndarray) -> np.ndarray:
-        """Signed distance to the mesh (negative inside) for ``x`` of shape ``(..., 3)``."""
+    def sdf(self, x: np.ndarray, chunk: int = 65536) -> np.ndarray:
+        """Signed distance to the mesh (negative inside) for ``x`` of shape ``(..., 3)``.
+
+        Queries are processed in chunks of ``chunk``: the closest-point routine builds
+        a ``(n_query, knn, 3, 3)`` candidate-triangle tensor, so evaluating millions of
+        points at once (e.g. a marching-cubes grid) would otherwise allocate tens to
+        hundreds of GB.  Chunking bounds the peak working set to a few hundred MB.
+        """
         x = np.asarray(x, dtype=np.float64)
         flat = x.reshape(-1, 3)
         method = self.sign_method
         if method == "auto":
             method = "trimesh" if self._trimesh_ok else "normal"
-        if method == "trimesh":
-            out = self._sdf_trimesh(flat)
-        elif method == "winding":
-            out = self._sdf_winding(flat)
-        elif method == "normal":
-            out = self._sdf_normal(flat)
-        else:
+        fn = {"trimesh": self._sdf_trimesh, "winding": self._sdf_winding,
+              "normal": self._sdf_normal}.get(method)
+        if fn is None:
             raise ValueError("unknown sign_method %r" % self.sign_method)
+        out = np.empty(len(flat), dtype=np.float64)
+        for i in range(0, len(flat), chunk):
+            out[i:i + chunk] = fn(flat[i:i + chunk])
         return out.reshape(x.shape[:-1])
 
     # ------------------------------------------------------------------ #

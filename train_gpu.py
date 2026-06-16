@@ -247,18 +247,24 @@ def batched_loss(net, pts, nrm, q, phi_true, k, C=64.0, eik=0.1, chunk=3072):
 #  Validation
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def validate_default_torus(net, C=16, npoints=1024, seed=123):
+def validate_recon(net, shapes, C=16, npoints=1024, seed=123, bound=1.2):
+    """Reconstruct each shape from a clean cloud; return mean abs SDF error per shape.
+
+    One CPU round-trip for the whole list (PAT inference runs on CPU).  We test a
+    default **torus** (the acceptance metric) and a sharp flat-sided **cube** (where
+    the supertoroid's boxy cross-section should beat the plain torus).
+    """
     from pat import PAT
-    from pat.shapes import Torus
-    net.eval()
+    net.eval(); net.to("cpu")
     rng = np.random.default_rng(seed)
-    sh = Torus(0.6, 0.24)
-    pts, nrm = sh.sample_surface(npoints, rng)
-    pat = PAT(pts, nrm, model=net.to("cpu"), k=16, C=C)
-    grid = rng.uniform(-1.2, 1.2, (4000, 3))
-    err = float(np.mean(np.abs(pat.sdf(grid, neighbors=64) - sh.sdf(grid))))
+    errs = []
+    for sh in shapes:
+        pts, nrm = sh.sample_surface(npoints, rng)
+        pat = PAT(pts, nrm, model=net, k=16, C=C)
+        grid = rng.uniform(-bound, bound, (4000, 3))
+        errs.append(float(np.mean(np.abs(pat.sdf(grid, neighbors=64) - sh.sdf(grid)))))
     net.to(DEVICE).train()
-    return err
+    return errs
 
 
 @torch.no_grad()
@@ -390,6 +396,9 @@ def main():
 
     gen = torch.Generator(device=DEVICE)
     rng = np.random.default_rng(0)
+    from pat.shapes import Torus
+    from pat.assets import Cube
+    val_shapes = [Torus(0.6, 0.24), Cube()]   # acceptance torus + a sharp flat-sided cube
     best = {"t": 1e9, "s": 1e9}
     history = []
     done = 0
@@ -434,15 +443,17 @@ def main():
                       f"noise {noise_e:.3f} loss T {rt/args.log_every:.4f} S {rs/args.log_every:.4f} "
                       f"| {rate:.1f} it/s | ETA {eta:.1f} min", flush=True)
                 rt = rs = 0.0
-        # end-of-epoch validation
-        vt = validate_default_torus(net_t)
-        vs = validate_default_torus(net_s)
+        # end-of-epoch validation: reconstruct a default torus AND a sharp cube
+        vt, vt_cube = validate_recon(net_t, val_shapes)
+        vs, vs_cube = validate_recon(net_s, val_shapes)
         ct, nt = eval_noise_split(net_t, eval_cache, args.k, args.noise, n_points=args.n_points)
         cs, ns = eval_noise_split(net_s, eval_cache, args.k, args.noise, n_points=args.n_points)
         print(f"epoch {epoch}  val-torus-err T {vt:.4f} S {vs:.4f} | "
+              f"val-cube-err T {vt_cube:.4f} S {vs_cube:.4f} | "
               f"eval clean/noisy  T {ct:.4f}/{nt:.4f}  S {cs:.4f}/{ns:.4f}  "
               f"[{time.time()-t0:.0f}s]", flush=True)
         history.append(dict(epoch=epoch, val_torus_t=vt, val_torus_s=vs,
+                            val_cube_t=vt_cube, val_cube_s=vs_cube,
                             eval_clean_t=ct, eval_noisy_t=nt, eval_clean_s=cs, eval_noisy_s=ns))
         import json
         with open(os.path.join(args.outdir, "train_history.json"), "w") as fh:
@@ -465,12 +476,15 @@ def save_curves(history, path):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         ep = [h["epoch"] for h in history]
+        nan = float("nan")
         fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-        ax[0].plot(ep, [h["val_torus_t"] for h in history], "-o", label="torus")
-        ax[0].plot(ep, [h["val_torus_s"] for h in history], "-o", label="supertoroid")
-        ax[0].axhline(0.01, ls="--", c="gray", label="invisible-by-eye bar")
-        ax[0].set_title("val: reconstruct a default torus")
-        ax[0].set_xlabel("epoch"); ax[0].set_ylabel("mean abs SDF err"); ax[0].legend()
+        ax[0].plot(ep, [h["val_torus_t"] for h in history], "-o", color="C0", label="torus-net | torus")
+        ax[0].plot(ep, [h["val_torus_s"] for h in history], "-o", color="C1", label="super-net | torus")
+        ax[0].plot(ep, [h.get("val_cube_t", nan) for h in history], "--s", color="C0", label="torus-net | cube")
+        ax[0].plot(ep, [h.get("val_cube_s", nan) for h in history], "--s", color="C1", label="super-net | cube")
+        ax[0].axhline(0.01, ls=":", c="gray", label="invisible-by-eye bar")
+        ax[0].set_title("val: reconstruct a default torus / sharp cube")
+        ax[0].set_xlabel("epoch"); ax[0].set_ylabel("mean abs SDF err"); ax[0].legend(fontsize=8)
         for m, lab in [("eval_clean_s", "supertoroid clean"), ("eval_noisy_s", "supertoroid noisy"),
                        ("eval_clean_t", "torus clean"), ("eval_noisy_t", "torus noisy")]:
             ax[1].plot(ep, [h[m] for h in history], "-o", label=lab)

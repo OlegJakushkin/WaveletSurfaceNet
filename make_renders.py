@@ -15,6 +15,7 @@ supertoroid's squareness) come from the network; otherwise they are optimized pe
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 
 import numpy as np
@@ -31,7 +32,7 @@ from pat.render import render_comparison
 
 
 def fit_models(shape, points, normals, *, model_t=None, model_s=None, model=None,
-               C=16, steps=120, k=16, fast=False):
+               C=16, steps=120, k=16, fast=False, device="cpu"):
     """Return ``{label: PAT}`` for torus and supertoroid fit to the same cloud.
 
     * ``model_t`` / ``model_s``: the dedicated trained torus and supertoroid
@@ -40,30 +41,34 @@ def fit_models(shape, points, normals, *, model_t=None, model_s=None, model=None
       coeffs with squareness ignored).
     * ``fast``: least-squares torus + squareness-only optimization (quick baseline).
     * otherwise: full per-cloud optimization of both models.
+
+    ``device`` ("cuda"/"cpu") is where the fitted PAT runs its SDF/reconstruction.
     """
+    def _np(t):
+        return t.detach().cpu().numpy()
     if model_t is not None or model_s is not None:
-        pat_t = PAT(points, normals, model=model_t, k=k, C=C)          # plain torus net
-        pat_s = PAT(points, normals, model=model_s, k=k, C=C)          # supertoroid net
+        pat_t = PAT(points, normals, model=model_t, k=k, C=C, device=device)   # plain torus net
+        pat_s = PAT(points, normals, model=model_s, k=k, C=C, device=device)   # supertoroid net
     elif model is not None:
-        full = PAT(points, normals, model=model, k=k)          # learned coeffs + squareness
-        coeffs = full.coeffs.numpy()
-        pat_t = PAT(points, normals, coeffs=coeffs, C=C)
+        full = PAT(points, normals, model=model, k=k, device=device)     # learned coeffs + squareness
+        coeffs = _np(full.coeffs)
+        pat_t = PAT(points, normals, coeffs=coeffs, C=C, device=device)
         pat_s = PAT(points, normals, coeffs=coeffs, supertoroid=True,
-                    p_tube=full.p_tube.numpy(), p_ring=full.p_ring.numpy(), C=C)
+                    p_tube=_np(full.p_tube), p_ring=_np(full.p_ring), C=C, device=device)
     elif fast:
         from pat.optimize import optimize_cloud
         from pat.lstsq import fit_coeffs_lstsq
         coeffs = fit_coeffs_lstsq(points, normals, k=24).numpy()
         ps, _ = optimize_cloud(points, normals, shape, supertoroid=True, steps=70,
                                n_query=800, warm_coeffs=coeffs, freeze_coeffs=True)
-        pat_t = PAT(points, normals, coeffs=coeffs, C=C)
+        pat_t = PAT(points, normals, coeffs=coeffs, C=C, device=device)
         pat_s = PAT(points, normals, coeffs=coeffs, supertoroid=True,
-                    p_tube=ps.p_tube.numpy(), p_ring=ps.p_ring.numpy(), C=C)
+                    p_tube=_np(ps.p_tube), p_ring=_np(ps.p_ring), C=C, device=device)
     else:
         pt, ps = fit_pair(points, normals, shape, steps=steps, n_query=1000, k=24)
-        pat_t = PAT(points, normals, coeffs=pt.coeffs.numpy(), C=C)
-        pat_s = PAT(points, normals, coeffs=ps.coeffs.numpy(), supertoroid=True,
-                    p_tube=ps.p_tube.numpy(), p_ring=ps.p_ring.numpy(), C=C)
+        pat_t = PAT(points, normals, coeffs=_np(pt.coeffs), C=C, device=device)
+        pat_s = PAT(points, normals, coeffs=_np(ps.coeffs), supertoroid=True,
+                    p_tube=_np(ps.p_tube), p_ring=_np(ps.p_ring), C=C, device=device)
     return {"torus (based on Feng 26)": pat_t, "supertoroid (ours)": pat_s}
 
 
@@ -81,16 +86,21 @@ def main():
                     help="output resolution multiplier (2.0 => 4x the pixels)")
     ap.add_argument("--fast", action="store_true",
                     help="least-squares torus + squareness-only supertoroid (quick)")
+    ap.add_argument("--outdir", default="assets",
+                    help="where to write the figures (default assets/, alongside the weights)")
     ap.add_argument("--only", default=None, help="render only this asset name")
     args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
     dpi = int(130 * args.scale)                  # 2.0 -> 260 dpi (4x pixels)
     slice_res = int(220 * args.scale)
+    device = "cuda" if torch.cuda.is_available() else "cpu"   # use the GPU when available
+    print(f"render device: {device}")
 
     def _load(path):
         if not path or not os.path.exists(path):
             return None
-        ck = torch.load(path, map_location="cpu", weights_only=False)
-        m = CoeffNet(**ck["config"]); m.load_state_dict(ck["state_dict"]); m.eval()
+        ck = torch.load(path, map_location=device, weights_only=False)
+        m = CoeffNet(**ck["config"]); m.load_state_dict(ck["state_dict"]); m.eval(); m.to(device)
         print(f"loaded {path}  (val-torus-err {ck.get('val_torus_err', '?')})")
         return m
 
@@ -121,12 +131,18 @@ def main():
             pts, nrm = shape.sample_surface(args.points, rng)
             label = str(args.points)
         pats = fit_models(shape, pts, nrm, model=model, model_t=model_t,
-                          model_s=model_s, C=opt["C"], fast=args.fast)
-        render_comparison(shape, pats, pts, f"renders/{name}.png", recon_res=args.res,
+                          model_s=model_s, C=opt["C"], fast=args.fast, device=device)
+        out_png = os.path.join(args.outdir, f"{name}.png")
+        render_comparison(shape, pats, pts, out_png, recon_res=args.res,
                           neighbors=96, npoints_label=label, smooth_iters=opt["smooth"],
                           view=opt.get("view", (22, -62)), slice_axis=opt.get("slice_axis", 2),
                           slice_res=slice_res, dpi=dpi)
-        print(f"  saved renders/{name}.png", flush=True)
+        print(f"  saved {out_png}", flush=True)
+        # release this asset's PAT objects (and any GPU tensors) before the next one
+        del pats
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
