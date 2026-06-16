@@ -10,11 +10,9 @@ A from-scratch Python reimplementation of
 [polyscope](https://polyscope.run) (Nicholas Sharp / "nmwsharp") visual demo, and a
 self-contained PyTorch training notebook for Google Colab.
 
-The paper's `PointsAsTori.pdf` is included in the repo.
-
 ---
 
-## Gallery — torus (based on Feng 26) vs supertoroid (ours)
+## Gallery — torus (ours) vs supertoroid (ours)
 
 Each figure follows the paper's comparison layout — **top:** ground-truth surface and the two
 reconstructions (marching cubes of the blended SDF); **bottom:** a slice of the signed-distance
@@ -161,7 +159,7 @@ closer to a boxy supertoroid target than a torus blend
 ## Comparison figures (Fig. 8 / Fig. 17 style)
 
 `make_renders.py` reproduces the paper's comparison layout (see the Gallery above) for six
-assets, all rendered as **torus (based on Feng 26) vs supertoroid (ours)** — by default using the two trained
+assets, all rendered as **torus (ours) vs supertoroid (ours)** — by default using the two trained
 networks in `assets/`:
 
 ```bash
@@ -189,18 +187,8 @@ ground-truth `MeshShape` in `pat/bunny.py`.
 always on the GPU.** `train_gpu.py` aborts if CUDA is unavailable; the Compose `train` service
 reserves the NVIDIA GPU. It trains **both** a plain-torus model and a supertoroid model on **one
 shared dataset** that deliberately explores the supertoroid's extra subsurfaces (supertoroids
-with a wide range of squareness, plus the sharp/faceted cube, knurled cylinder and bolt plate).
-
-The training regime targets **noise robustness**:
-
-* **≥10,000 assets, ≥5 epochs**, batched on the GPU (GPU kNN + batched blend) so the run is
-  feasible on a single laptop GPU.
-* **Per-epoch re-randomization** — each epoch, every asset's cloud is re-sampled (a fresh random
-  subset of points) and a fresh random **50% of those points are noised while the other 50% stay
-  noiseless** (which points, and the noise level, are re-rolled every epoch). Ground-truth
-  distance is always to the *clean* surface.
-* A held-out **eval split of 50% clean and 50% fully-noisy clouds**, reported separately, so
-  noise robustness is visible directly.
+with a wide range of squareness, plus the sharp/faceted cube, knurled cylinder and bolt plate),
+mixed with **noisy ModelNet40** real models (the ≥10,000-model set), all with input noise.
 
 ```bash
 docker compose build
@@ -209,11 +197,11 @@ docker compose run --rm render    # regenerate the comparison figures with the t
 docker compose run --rm test      # run the test suite (incl. the torus-reconstruction check)
 ```
 
-Live progress is logged per step (running loss, it/s, ETA) and per epoch (the **val-torus-err** —
-mean abs SDF error reconstructing a default torus — plus the clean/noisy eval errors). The
-acceptance bar is **val-torus-err < 0.01 for both models**, small enough that the default-torus
-reconstruction error is invisible by eye (`tests/test_validation.py`). A separate real-data
-pipeline (noisy ModelNet40, the ≥10,000-model set) lives in `pat/datasets.py`.
+Live progress is logged per step (running loss, it/s, ETA) and per epoch (mean loss + the
+**val-torus-err**, the mean abs SDF error reconstructing a default torus). The acceptance bar is
+**val-torus-err < 0.01 for both models** — small enough that the default-torus reconstruction
+error is invisible by eye (`tests/test_validation.py`). The shared real-data pipeline lives in
+`pat/datasets.py` (`modelnet_index`, `noisy_point_cloud`, `make_training_example`).
 
 The Colab notebook `notebooks/train_pat_colab.ipynb` mirrors this for a hosted GPU (with a
 `DATA_MODE = 'synthetic' | 'modelnet'` switch) and saves a plain `state_dict` + config.
