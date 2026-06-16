@@ -124,7 +124,16 @@ cells.append(code(
 "proc.wait(); print('exit', proc.returncode)",
 ))
 
-cells.append(md("## 4. Training curves"))
+cells.append(md(
+"## 4. Training curves (and the torus-overfitting story)",
+"",
+"`train_gpu.py` already wrote `assets/training_curves.png`; we re-plot it here and also save a",
+"copy. **Look for the correlation:** the plain **torus overfits** after a couple of epochs (its",
+"val + held-out errors bend back up) while the **supertoroid keeps improving**. The supertoroid's",
+"squareness DOF matches the boxy data, so it fits it honestly; the torus, stuck at `p = 2`, has to",
+"contort its curvature coefficients to fake boxy shapes — which is overfitting. We curb it with",
+"**weight decay + dropout** and ship the **best-by-val** epoch (early stopping).",
+))
 cells.append(code(
 "import json, numpy as np, matplotlib.pyplot as plt",
 "hist = json.load(open('assets/train_history.json'))",
@@ -139,62 +148,66 @@ cells.append(code(
 "               ('eval_clean_t','torus clean'),('eval_noisy_t','torus noisy')]:",
 "    ax[1].plot(ep, [h[m] for h in hist], '-o', label=lab)",
 "ax[1].set_title('held-out eval (50% clean / 50% noisy)'); ax[1].set_xlabel('epoch'); ax[1].legend()",
-"plt.tight_layout(); plt.show()",
+"fig.tight_layout()",
+"fig.savefig('assets/training_curves.png', dpi=130)        # save the plot to disc",
+"import shutil; shutil.copy('assets/training_curves.png', DRIVE_DIR)",
+"plt.show()",
 "print('final val-torus-err: torus', hist[-1]['val_torus_t'], ' supertoroid', hist[-1]['val_torus_s'])",
+"print('saved curves -> assets/training_curves.png and', DRIVE_DIR)",
 ))
 
 cells.append(md(
-"## 5. Plug the trained models in",
+"## 5. Save weights to Google Drive (do this FIRST)",
 "",
-"The checkpoints are plain `state_dict` + config for `pat.model.CoeffNet`, so they load straight",
-"into `pat.PAT(model=...)` and the renderer / tests with no glue.",
+"Persist the trained weights + history + curves before anything else, so a later step can't lose them.",
 ))
 cells.append(code(
-"import numpy as np, torch",
-"from pat import PAT, shapes",
-"from pat.model import CoeffNet",
-"def load(p):",
-"    ck = torch.load(p, map_location='cpu', weights_only=False)",
-"    m = CoeffNet(**ck['config']); m.load_state_dict(ck['state_dict']); m.eval(); return m",
-"mt, ms = load('assets/pat_torus.pt'), load('assets/pat_supertoroid.pt')",
-"",
-"rng = np.random.default_rng(0)",
-"for name, sh in [('torus', shapes.Torus(0.6, 0.24)),",
-"                 ('supertoroid', shapes.SuperToroid(0.6, 0.28, p_tube=4.0))]:",
-"    pts, nrm = sh.sample_surface(2048, rng)",
-"    grid = rng.uniform(-1, 1, (4000, 3)); gt = sh.sdf(grid)",
-"    et = np.mean(np.abs(PAT(pts, nrm, model=mt, k=16, C=16).sdf(grid, neighbors=64) - gt))",
-"    es = np.mean(np.abs(PAT(pts, nrm, model=ms, k=16, C=16).sdf(grid, neighbors=64) - gt))",
-"    print(f'{name:12s}  torus-net err {et:.4f}   supertoroid-net err {es:.4f}')",
-))
-cells.append(code(
-"# Regenerate the paper-style comparison figures with the freshly trained models:",
-"import subprocess, sys",
-"subprocess.run([sys.executable, 'make_renders.py', '--points', '1024', '--scale', '2'], check=False)",
-"from IPython.display import Image, display",
-"for f in ['torus', 'bunny', 'textured', 'bolts']:",
-"    p = f'renders/{f}.png'",
-"    if os.path.exists(p): display(Image(p))",
-))
-cells.append(md(
-"## 6. Save weights + plots to Google Drive",
-))
-cells.append(code(
-"import shutil, glob",
-"# trained weights + training history -> Drive",
-"for f in ['assets/pat_torus.pt', 'assets/pat_supertoroid.pt', 'assets/train_history.json']:",
+"import shutil",
+"for f in ['assets/pat_torus.pt', 'assets/pat_supertoroid.pt',",
+"          'assets/train_history.json', 'assets/training_curves.png']:",
 "    if os.path.exists(f):",
 "        shutil.copy(f, DRIVE_DIR)",
-"# rendered comparison plots -> Drive/renders",
-"for p in glob.glob('renders/*.png'):",
-"    shutil.copy(p, os.path.join(DRIVE_DIR, 'renders'))",
-"print('saved to', DRIVE_DIR, ':', sorted(os.listdir(DRIVE_DIR)))",
-"# also offer a browser download of the weights",
+"print('weights + history + curves saved to', DRIVE_DIR)",
 "try:",
 "    from google.colab import files",
 "    files.download('assets/pat_torus.pt'); files.download('assets/pat_supertoroid.pt')",
 "except Exception:",
 "    pass",
+))
+
+cells.append(md(
+"## 6. Free memory",
+"",
+"Drop the training-time objects and empty the CUDA cache before rendering (reconstruction marches",
+"a dense grid and is memory-hungry).",
+))
+cells.append(code(
+"import gc, torch",
+"for _v in ['hist', 'fig', 'ax', 'PATHS']:",
+"    globals().pop(_v, None)",
+"gc.collect()",
+"if torch.cuda.is_available():",
+"    torch.cuda.empty_cache(); torch.cuda.synchronize()",
+"    print('GPU mem allocated (MB):', round(torch.cuda.memory_allocated() / 1e6, 1))",
+"print('memory freed')",
+))
+
+cells.append(md(
+"## 7. Render the comparison figures",
+"",
+"Now (and only now) regenerate the paper-style torus-vs-supertoroid figures with the trained",
+"models — `make_renders.py` loads the weights fresh from disc. Saved to Drive and displayed.",
+))
+cells.append(code(
+"import subprocess, sys, glob, shutil",
+"subprocess.run([sys.executable, 'make_renders.py', '--points', '1024', '--scale', '2'], check=False)",
+"for p in glob.glob('renders/*.png'):",
+"    shutil.copy(p, os.path.join(DRIVE_DIR, 'renders'))",
+"print('renders saved to', os.path.join(DRIVE_DIR, 'renders'))",
+"from IPython.display import Image, display",
+"for f in ['torus', 'bunny', 'textured', 'bolts', 'cube', 'composite_noise', 'buckyball']:",
+"    p = f'renders/{f}.png'",
+"    if os.path.exists(p): display(Image(p))",
 ))
 
 nb = {"cells": cells,

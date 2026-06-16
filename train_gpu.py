@@ -323,12 +323,23 @@ def main():
     ap.add_argument("--noise", type=float, default=0.015)
     ap.add_argument("--eval-assets", type=int, default=400)
     ap.add_argument("--lr", type=float, default=8e-4)
+    ap.add_argument("--weight-decay", type=float, default=1e-4,
+                    help="AdamW weight decay (regularization; curbs the torus overfitting)")
+    ap.add_argument("--dropout", type=float, default=0.05,
+                    help="transformer dropout (regularization)")
     ap.add_argument("--outdir", default="assets")
     ap.add_argument("--cache-file", default="",
                     help="persist the dense cache here; reused if present (skips re-caching)")
     ap.add_argument("--log-every", type=int, default=80, help="log every N steps")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
+    # The per-epoch point-subset re-sampling only varies if we cache MORE points than
+    # we fetch; otherwise every epoch just permutes the same set (identical kNN).
+    args.n_points = min(args.n_points, args.dense)
+    if args.dense <= args.n_points:
+        print(f"WARNING: --dense ({args.dense}) <= --n-points ({args.n_points}): the fetched "
+              f"point set will NOT vary across epochs (only the noise will). Use --dense > "
+              f"--n-points for per-epoch nearest-set variation.", flush=True)
     print(f"device: {torch.cuda.get_device_name(0)} | analytic {args.assets} + "
           f"modelnet {args.modelnet} | epochs {args.epochs} | batch {args.batch}", flush=True)
 
@@ -356,18 +367,26 @@ def main():
     cache = {kk: v.to(DEVICE) for kk, v in cache.items()}
     eval_cache = build_dense_cache(args.eval_assets, args.dense, args.n_query, seed=999)
 
-    cfg_t = dict(d_embed=128, n_layers=6, n_heads=8, d_ff=512, supertoroid=False)
-    cfg_s = dict(d_embed=128, n_layers=6, n_heads=8, d_ff=512, supertoroid=True)
+    cfg_t = dict(d_embed=128, n_layers=6, n_heads=8, d_ff=512, supertoroid=False,
+                 dropout=args.dropout)
+    cfg_s = dict(d_embed=128, n_layers=6, n_heads=8, d_ff=512, supertoroid=True,
+                 dropout=args.dropout)
     net_t = CoeffNet(**cfg_t).to(DEVICE)
     net_s = CoeffNet(**cfg_s).to(DEVICE)
-    opt_t = torch.optim.Adam(net_t.parameters(), lr=args.lr)
-    opt_s = torch.optim.Adam(net_s.parameters(), lr=args.lr)
+    # AdamW (decoupled weight decay) regularizes -- it most helps the plain torus,
+    # which otherwise overfits by contorting its curvature coefficients to fake the
+    # boxy shapes its fixed circular cross-section can't represent.
+    opt_t = torch.optim.AdamW(net_t.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt_s = torch.optim.AdamW(net_s.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = A // args.batch
     total = args.epochs * steps_per_epoch
     sch_t = torch.optim.lr_scheduler.CosineAnnealingLR(opt_t, T_max=total)
     sch_s = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=total)
     print(f"{total} steps ({args.epochs} epochs x {steps_per_epoch} batches of {args.batch}) "
           f"x 2 models over {A} assets", flush=True)
+    print(f"per-epoch (re-rolled each epoch): resample {args.n_points}/{args.dense} pts per asset "
+          f"(set varies={args.dense > args.n_points}); re-noise {args.frac_noisy:.0%} of them with "
+          f"fresh noise; kNN recomputed per step", flush=True)
 
     gen = torch.Generator(device=DEVICE)
     rng = np.random.default_rng(0)
@@ -436,6 +455,31 @@ def main():
                             "val_torus_err": v, "history": history},
                            os.path.join(args.outdir, name))
     print(f"DONE. best val-torus-err  torus {best['t']:.4f}  supertoroid {best['s']:.4f}", flush=True)
+    save_curves(history, os.path.join(args.outdir, "training_curves.png"))
+
+
+def save_curves(history, path):
+    """Save the val + clean/noisy eval curves to ``path`` (headless)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        ep = [h["epoch"] for h in history]
+        fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+        ax[0].plot(ep, [h["val_torus_t"] for h in history], "-o", label="torus")
+        ax[0].plot(ep, [h["val_torus_s"] for h in history], "-o", label="supertoroid")
+        ax[0].axhline(0.01, ls="--", c="gray", label="invisible-by-eye bar")
+        ax[0].set_title("val: reconstruct a default torus")
+        ax[0].set_xlabel("epoch"); ax[0].set_ylabel("mean abs SDF err"); ax[0].legend()
+        for m, lab in [("eval_clean_s", "supertoroid clean"), ("eval_noisy_s", "supertoroid noisy"),
+                       ("eval_clean_t", "torus clean"), ("eval_noisy_t", "torus noisy")]:
+            ax[1].plot(ep, [h[m] for h in history], "-o", label=lab)
+        ax[1].set_title("held-out eval (50% clean / 50% noisy)")
+        ax[1].set_xlabel("epoch"); ax[1].legend()
+        fig.tight_layout(); fig.savefig(path, dpi=130); plt.close(fig)
+        print(f"saved training curves -> {path}", flush=True)
+    except Exception as e:
+        print(f"(curve plot not saved: {e})", flush=True)
 
 
 if __name__ == "__main__":
