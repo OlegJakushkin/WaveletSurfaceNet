@@ -120,43 +120,10 @@ def random_analytic_shape(rng):
     return BoxWithCylinders()
 
 
-def _queries(rng, surf, n_query, bound):
-    nb = n_query // 2
-    band = surf[:nb] + rng.normal(scale=0.04, size=(nb, 3))
-    bulk = rng.uniform(-bound, bound, size=(n_query - nb, 3))
-    return np.concatenate([band, bulk], 0)
-
-
-def mesh_dense_example(path, dense, n_query, rng, bound=1.0, dense_surf=50000,
-                       max_faces=None):
-    """One dense (cloud, normals, queries, GT SDF) tuple from a real mesh.
-
-    Ground-truth signed distance uses a KD-tree over a dense surface sample
-    (fast and accurate to the surface spacing) -- the same trick as the local
-    trainer, which keeps real-data caching fast on a hosted GPU/disk.
-    ``max_faces`` skips pathologically heavy meshes (see ``load_mesh_normalized``).
-    """
-    from scipy.spatial import cKDTree
-    from pat.datasets import load_mesh_normalized
-    from pat.shapes import sample_mesh
-    mesh = load_mesh_normalized(path, max_faces=max_faces)
-    pts, nrm = sample_mesh(mesh, dense, rng)
-    # ModelNet meshes have duplicate/degenerate faces -> coincident points and the
-    # occasional zero-area-face normal.  Jitter the cloud (breaks coincidences, which
-    # otherwise make a neighborhood's median distance 0 and blow up the features) and
-    # replace degenerate normals with a fallback.
-    pts = pts + rng.normal(scale=1e-4, size=pts.shape)
-    nn = np.linalg.norm(nrm, axis=1, keepdims=True)
-    nrm = np.where(nn < 1e-6, np.array([0.0, 0.0, 1.0]), nrm / (nn + 1e-9))
-    surf, _ = sample_mesh(mesh, n_query, rng)
-    q = _queries(rng, surf, n_query, bound)
-    ds, dn = sample_mesh(mesh, dense_surf, rng)
-    tree = cKDTree(ds)
-    d, idx = tree.query(q)
-    sign = np.einsum("ij,ij->i", q - ds[idx], dn[idx])
-    phi = np.where(sign >= 0, d, -d)
-    return (pts.astype(np.float32), nrm.astype(np.float32),
-            q.astype(np.float32), phi.astype(np.float32))
+# The per-mesh GT example + query sampler live in pat.datasets (so the Colab
+# notebook can build the cache incrementally, per ABC chunk, without importing
+# this CUDA-gated module).
+from pat.datasets import mesh_dense_example, surface_band_queries as _queries
 
 
 def build_dense_cache(n_analytic, dense, n_query, bound=1.0, seed=0,
@@ -437,6 +404,10 @@ def main():
     ap.add_argument("--outdir", default="assets")
     ap.add_argument("--cache-file", default="",
                     help="persist the dense cache here; reused if present (skips re-caching)")
+    ap.add_argument("--mesh-cache-file", default="",
+                    help="pre-built mesh-only cache (P/N/Q/PHI) from the notebook's "
+                         "incremental per-chunk build; concatenated after the analytic "
+                         "assets so the trainer never needs the raw meshes on disk")
     ap.add_argument("--log-every", type=int, default=80, help="log every N steps")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -467,9 +438,24 @@ def main():
                   f"(assets+meshes<={args.assets+args.meshes}, dense={args.dense}, "
                   f"n_query={args.n_query}) -> rebuilding", flush=True)
     if cache is None:
-        cache = build_dense_cache(args.assets, args.dense, args.n_query, seed=0,
-                                  n_meshes=args.meshes, mesh_root=args.mesh_root,
-                                  max_faces=args.max_faces)
+        if args.mesh_cache_file and os.path.exists(args.mesh_cache_file):
+            # Analytic assets built here (cheap, no disk); the real meshes were
+            # pre-cached by the notebook incrementally (download -> cache -> delete
+            # the extracted .obj per chunk), so no raw meshes are touched here.
+            ana = build_dense_cache(args.assets, args.dense, args.n_query, seed=0, n_meshes=0)
+            mc = torch.load(args.mesh_cache_file, weights_only=False)
+            if mc["P"].shape[1] != args.dense or mc["Q"].shape[1] != args.n_query:
+                raise SystemExit(
+                    f"--mesh-cache-file shape (dense={mc['P'].shape[1]}, "
+                    f"n_query={mc['Q'].shape[1]}) != --dense {args.dense} / "
+                    f"--n-query {args.n_query}")
+            cache = {k: torch.cat([ana[k], mc[k]], 0) for k in ("P", "N", "Q", "PHI")}
+            print(f"assembled cache: {ana['P'].shape[0]} analytic + {mc['P'].shape[0]} "
+                  f"pre-cached meshes = {cache['P'].shape[0]} assets", flush=True)
+        else:
+            cache = build_dense_cache(args.assets, args.dense, args.n_query, seed=0,
+                                      n_meshes=args.meshes, mesh_root=args.mesh_root,
+                                      max_faces=args.max_faces)
         if args.cache_file:
             os.makedirs(os.path.dirname(args.cache_file) or ".", exist_ok=True)
             torch.save(cache, args.cache_file)

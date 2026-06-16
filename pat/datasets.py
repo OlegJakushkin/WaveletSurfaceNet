@@ -298,3 +298,79 @@ def iter_training_examples(paths, rng, *, skip_errors=True, **kw):
             # Skip this mesh and try another draw on the next iteration.
             _ = exc
             continue
+
+
+# --------------------------------------------------------------------------- #
+#  Dense per-mesh cache (the GPU trainer's "cache once, reuse" representation)
+# --------------------------------------------------------------------------- #
+def surface_band_queries(rng, surf, n_query, bound):
+    """Query points: half in a thin band hugging ``surf``, half uniform in the cube."""
+    nb = n_query // 2
+    band = surf[:nb] + rng.normal(scale=0.04, size=(nb, 3))
+    bulk = rng.uniform(-bound, bound, size=(n_query - nb, 3))
+    return np.concatenate([band, bulk], 0)
+
+
+def mesh_dense_example(path, dense, n_query, rng, bound=1.0, dense_surf=50000,
+                       max_faces=None):
+    """One dense ``(cloud, normals, queries, GT SDF)`` tuple from a real mesh.
+
+    Ground-truth signed distance uses a KD-tree over a dense surface sample (fast
+    and accurate to the surface spacing).  ``max_faces`` skips pathologically heavy
+    meshes (see :func:`load_mesh_normalized`).  Returns four float32 numpy arrays.
+    """
+    from scipy.spatial import cKDTree
+    mesh = load_mesh_normalized(path, max_faces=max_faces)
+    pts, nrm = shapes.sample_mesh(mesh, dense, rng)
+    # Real meshes have duplicate/degenerate faces -> coincident points and the
+    # occasional zero-area-face normal.  Jitter the cloud (breaks coincidences,
+    # which otherwise make a neighborhood's median distance 0 and blow up the
+    # features) and replace degenerate normals with a fallback.
+    pts = pts + rng.normal(scale=1e-4, size=pts.shape)
+    nn = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = np.where(nn < 1e-6, np.array([0.0, 0.0, 1.0]), nrm / (nn + 1e-9))
+    surf, _ = shapes.sample_mesh(mesh, n_query, rng)
+    q = surface_band_queries(rng, surf, n_query, bound)
+    ds, dn = shapes.sample_mesh(mesh, dense_surf, rng)
+    tree = cKDTree(ds)
+    d, idx = tree.query(q)
+    sign = np.einsum("ij,ij->i", q - ds[idx], dn[idx])
+    phi = np.where(sign >= 0, d, -d)
+    return (pts.astype(np.float32), nrm.astype(np.float32),
+            q.astype(np.float32), phi.astype(np.float32))
+
+
+def build_mesh_cache(paths, dense, n_query, bound=1.0, max_faces=None, seed=0,
+                     limit=None, log_every=1000):
+    """Stack ``(P, N, Q, PHI)`` tensors for the loadable meshes in ``paths``.
+
+    The incremental building block the Colab notebook calls **per ABC chunk**, so a
+    chunk's meshes can be cached and then its extracted ``.obj`` files deleted
+    before the next chunk is fetched -- keeping peak disk to one chunk instead of
+    the whole corpus.  Degenerate / over-budget / unreadable meshes are skipped;
+    returns a dict of CPU ``torch`` tensors ``{P, N, Q, PHI}`` (shapes
+    ``(M, dense, 3)``/``(M, dense, 3)``/``(M, n_query, 3)``/``(M, n_query)``), or
+    ``None`` if nothing usable was found.
+    """
+    import time
+    rng = np.random.default_rng(seed)
+    P, N, Q, PHI = [], [], [], []
+    tried, t0 = 0, time.time()
+    for path in paths:
+        if limit is not None and len(P) >= limit:
+            break
+        tried += 1
+        try:
+            ex = mesh_dense_example(path, dense, n_query, rng, bound, max_faces=max_faces)
+        except Exception:
+            continue
+        if not all(np.isfinite(a).all() for a in ex):       # drop degenerate meshes
+            continue
+        P.append(ex[0]); N.append(ex[1]); Q.append(ex[2]); PHI.append(ex[3])
+        if log_every and len(P) % log_every == 0:
+            print(f"  cached {len(P)} meshes (kept {len(P)}/{tried}; "
+                  f"{len(P)/(time.time()-t0):.0f}/s)", flush=True)
+    if not P:
+        return None
+    return {"P": torch.from_numpy(np.stack(P)), "N": torch.from_numpy(np.stack(N)),
+            "Q": torch.from_numpy(np.stack(Q)), "PHI": torch.from_numpy(np.stack(PHI))}
