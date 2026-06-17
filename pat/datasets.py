@@ -341,7 +341,7 @@ def mesh_dense_example(path, dense, n_query, rng, bound=1.0, dense_surf=50000,
 
 
 def build_mesh_cache(paths, dense, n_query, bound=1.0, max_faces=None, seed=0,
-                     limit=None, log_every=1000):
+                     limit=None, shuffle=True, log_every=1000):
     """Stack ``(P, N, Q, PHI)`` tensors for the loadable meshes in ``paths``.
 
     The incremental building block the Colab notebook calls **per ABC chunk**, so a
@@ -351,9 +351,18 @@ def build_mesh_cache(paths, dense, n_query, bound=1.0, max_faces=None, seed=0,
     returns a dict of CPU ``torch`` tensors ``{P, N, Q, PHI}`` (shapes
     ``(M, dense, 3)``/``(M, dense, 3)``/``(M, n_query, 3)``/``(M, n_query)``), or
     ``None`` if nothing usable was found.
+
+    With ``shuffle`` (the default) ``paths`` is permuted with ``seed`` *before*
+    sampling, so a ``limit`` -- or an interrupted run -- keeps a **uniformly random**
+    subset instead of the lowest-sorted model IDs.  This matters for ABC: each chunk
+    packs sequential, often-correlated model IDs, so without the shuffle a capped /
+    partial cache would be a biased, non-diverse slice of one ID range.
     """
     import time
     rng = np.random.default_rng(seed)
+    paths = list(paths)
+    if shuffle:
+        rng.shuffle(paths)
     P, N, Q, PHI = [], [], [], []
     tried, t0 = 0, time.time()
     for path in paths:
@@ -374,3 +383,62 @@ def build_mesh_cache(paths, dense, n_query, bound=1.0, max_faces=None, seed=0,
         return None
     return {"P": torch.from_numpy(np.stack(P)), "N": torch.from_numpy(np.stack(N)),
             "Q": torch.from_numpy(np.stack(Q)), "PHI": torch.from_numpy(np.stack(PHI))}
+
+
+# --------------------------------------------------------------------------- #
+#  Class-stratified subset selection (diversity across imbalanced corpora)
+# --------------------------------------------------------------------------- #
+def modelnet_class_of(path: str) -> str:
+    """Infer a ModelNet-style class label from a mesh path.
+
+    Handles both layouts: ``<class>/<train|test>/<file>.off`` (ModelNet10/40) and
+    ``<class>/<file>.off`` (the full set) -- the class is the nearest enclosing
+    directory that is not a ``train``/``test`` split folder.
+    """
+    d = os.path.dirname(path)
+    base = os.path.basename(d)
+    if base.lower() in ("train", "test"):
+        base = os.path.basename(os.path.dirname(d))
+    return base
+
+
+def stratified_sample(paths, total=None, min_per_class=3, seed=0, class_of=None):
+    """Pick a class-diverse subset of ``paths``.
+
+    Guarantees **at least ``min_per_class`` items from every class** (or *all* of a
+    class when it has fewer than that) before filling the remainder up to ``total``
+    uniformly at random from the leftovers -- so an imbalanced corpus (e.g. the full
+    ModelNet's 662 classes, whose sizes vary widely) keeps every class represented
+    instead of letting a pure random draw starve or miss the small ones.
+
+    Args:
+        paths: candidate mesh paths.
+        total: target subset size (``None`` = keep everything).  If the guaranteed
+            per-class minimums already exceed ``total`` they are kept anyway
+            (diversity wins over the exact budget).
+        min_per_class: floor of items reserved per class.
+        class_of: ``path -> class`` label fn (default :func:`modelnet_class_of`).
+
+    Returns a shuffled list of selected paths.
+    """
+    import collections
+    rng = np.random.default_rng(seed)
+    label = class_of or modelnet_class_of
+    by_class = collections.defaultdict(list)
+    for p in paths:
+        by_class[label(p)].append(p)
+
+    selected, leftover = [], []
+    for items in by_class.values():
+        items = list(items)
+        rng.shuffle(items)
+        k = min(min_per_class, len(items))
+        selected.extend(items[:k])          # guaranteed per-class minimum
+        leftover.extend(items[k:])
+    if total is not None and len(selected) < total:
+        rng.shuffle(leftover)
+        selected.extend(leftover[:total - len(selected)])
+    rng.shuffle(selected)
+    print(f"stratified sample: {len(selected)} meshes from {len(by_class)} classes "
+          f"(>= {min_per_class}/class guaranteed)", flush=True)
+    return selected

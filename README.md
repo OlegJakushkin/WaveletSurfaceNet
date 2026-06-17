@@ -190,11 +190,12 @@ always on the GPU.** `train_gpu.py` aborts if CUDA is unavailable; the Compose `
 reserves the NVIDIA GPU. It trains **both** a plain-torus model and a supertoroid model on **one
 shared dataset** that deliberately explores the supertoroid's extra subsurfaces (supertoroids
 with a wide range of squareness, plus the sharp/faceted cube, knurled cylinder and bolt plate),
-mixed with **≥50,000 real CAD meshes from the [ABC dataset](https://deep-geometry.github.io/abc-dataset/)**
-(mechanical parts — brackets, gears, bolts, machined bodies — exactly the torus/supertoroid/cube
-domain), all with input noise. `pat.datasets.mesh_index` finds whatever real-mesh corpus is in
-`data/` (ABC `.obj`, Objaverse `.glb`, or ModelNet40 `.off`), so the trainer is dataset-agnostic;
-mix the real meshes in with `--meshes N --mesh-root data`.
+mixed with **40,000 real CAD meshes drawn class-stratified from the full ModelNet dataset**
+(~128k models / 662 categories) — **≥3 meshes per class** so every category is represented despite
+ModelNet's class imbalance (`pat.datasets.stratified_sample`), all with input noise.
+`pat.datasets.mesh_index` finds whatever real-mesh corpus is in `data/` (ModelNet `.off`, or `.obj`
+/ `.glb` from other sources), so the trainer is dataset-agnostic; mix the real meshes in with
+`--meshes N --mesh-root data` or feed a pre-built `--mesh-cache-file`.
 
 **Network (`CoeffNet`).** The coefficient predictor is a ~2× wider transformer than the paper's
 default — `d_embed=192, n_layers=6, n_heads=12, d_ff=672` (~2.06× the parameters). Width, not
