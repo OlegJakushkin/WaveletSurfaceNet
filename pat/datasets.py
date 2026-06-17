@@ -442,3 +442,73 @@ def stratified_sample(paths, total=None, min_per_class=3, seed=0, class_of=None)
     print(f"stratified sample: {len(selected)} meshes from {len(by_class)} classes "
           f"(>= {min_per_class}/class guaranteed)", flush=True)
     return selected
+
+
+# --------------------------------------------------------------------------- #
+#  Objaverse GLB fetch (robust, no-auth, no objaverse package)
+# --------------------------------------------------------------------------- #
+_OBJAVERSE_BASE = "https://huggingface.co/datasets/allenai/objaverse/resolve/main"
+
+
+def objaverse_object_paths(cache_path="data/object-paths.json.gz"):
+    """Download once (no auth) and return the Objaverse ``uid -> relative .glb path`` map.
+
+    ~20 MB, ~799k entries.  Cached at ``cache_path`` so repeat calls are free.
+    """
+    import urllib.request
+    import gzip
+    import json
+    if not os.path.isfile(cache_path):
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        urllib.request.urlretrieve(_OBJAVERSE_BASE + "/object-paths.json.gz", cache_path)
+    with gzip.open(cache_path, "rt", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def fetch_objaverse_glbs(uids, out_dir, paths=None, workers=32, timeout=60, retries=2):
+    """Download GLBs for ``uids`` into ``out_dir``; return ``{uid: local_path}`` (failures skipped).
+
+    A robust, no-auth replacement for ``objaverse.load_objects`` that does NOT use a
+    multiprocessing pool: each file is fetched in a thread with a real socket
+    ``timeout`` and ``retries``, and **any error is caught and the uid skipped**.  This
+    sidesteps two real failure modes of the ``objaverse`` package on large batches:
+
+    * a truncated download raises ``ContentTooShortError``, which the package's
+      ``multiprocessing.Pool`` cannot un-pickle back to the parent -- it kills the
+      results thread and the whole call **hangs forever** (the "frozen at 498/500"
+      symptom);
+    * a single stalled connection has no per-file timeout and blocks indefinitely.
+
+    Threads (I/O-bound) keep it fast while keeping every exception local and recoverable.
+    """
+    import urllib.request
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    paths = paths if paths is not None else objaverse_object_paths()
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _one(uid):
+        rel = paths.get(uid)
+        if not rel:
+            return uid, None
+        dst = os.path.join(out_dir, uid + ".glb")
+        url = _OBJAVERSE_BASE + "/" + rel
+        for _ in range(retries + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=timeout) as r, open(dst, "wb") as fh:
+                    shutil.copyfileobj(r, fh)
+                if os.path.getsize(dst) > 0:
+                    return uid, dst
+            except Exception:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+        return uid, None
+
+    got = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for uid, dst in ex.map(_one, list(uids)):
+            if dst:
+                got[uid] = dst
+    return got
