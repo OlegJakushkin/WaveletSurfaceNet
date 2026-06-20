@@ -68,18 +68,29 @@ class CloudShape:
     :func:`pat.splat.fit_shape`, which only ever calls ``shape.sdf(q)``.
     """
 
-    def __init__(self, P, N, k_dense=50_000, seed=0):
+    def __init__(self, P, N, k_dense=50_000, seed=0, k_sign=16):
         self.ds, self.dn = densify_surface(P, N, k_dense, seed)
         self.tree = cKDTree(self.ds)
+        self.k_sign = k_sign
 
-    def sdf(self, q, chunk=500_000):
+    def sdf(self, q, chunk=200_000):
+        """Signed distance: magnitude = nearest-surface distance; SIGN = distance-weighted vote of the
+        ``k_sign`` nearest surface points' pseudo-normals.  The k-NN vote is essential on REAL meshes --
+        a SINGLE nearest normal (k=1) flips wherever one face normal is inconsistent (flipped/double-
+        sided geometry), producing spurious interior pockets / spikes in the occupancy; voting over a
+        neighborhood suppresses those, leaving a clean solid."""
         q = np.asarray(q, np.float64)
         out = np.empty(len(q), np.float64)
+        K = int(min(self.k_sign, len(self.ds)))
         for a in range(0, len(q), chunk):
             qq = q[a:a + chunk]
-            d, idx = self.tree.query(qq, workers=-1)                        # all CPU cores (KD-tree)
-            sign = np.einsum("ij,ij->i", qq - self.ds[idx], self.dn[idx])   # local pseudo-normal sign
-            out[a:a + chunk] = np.where(sign >= 0, d, -d)
+            d, idx = self.tree.query(qq, k=K, workers=-1)                   # (q,K) nearest surface pts
+            if K == 1:                                                     # scipy returns 1-D for k=1
+                d = d[:, None]; idx = idx[:, None]
+            diff = qq[:, None, :] - self.ds[idx]                           # (q,K,3)
+            dots = np.einsum("qkc,qkc->qk", diff, self.dn[idx])            # signed projection per neighbor
+            s = np.sign((dots / (d + 1e-6)).sum(1))                        # distance-weighted sign vote
+            out[a:a + chunk] = np.where(s >= 0, d[:, 0], -d[:, 0])
         return out
 
 
@@ -128,7 +139,6 @@ def md_filled_volume(splat, occ_gt, res=128, bound=1.0, device="cuda", return_io
     splat = splat.to(device)                                        # tolerate a CPU-assembled field
     base = grid_centers(res, bound)
     occ_gt_t = torch.as_tensor(np.asarray(occ_gt), device=device)
-    vox = (2.0 * bound / res) ** 3
     sym = torch.zeros((), device=device)
     inter = union = torch.zeros((), device=device)
     for i, o in enumerate(_offsets(res, bound)):
@@ -138,7 +148,7 @@ def md_filled_volume(splat, occ_gt, res=128, bound=1.0, device="cuda", return_io
         if return_iou:
             inter = inter + (occ & gt).float().sum()
             union = union + (occ | gt).float().sum()
-    md = float(sym / len(_OFF_FRAC) * occ_gt_t.shape[1] * vox)       # mean-mismatch-fraction * cube vol
+    md = float(sym / len(_OFF_FRAC))                                 # FRACTION of cube volume vol(A xor B)/vol(cube)
     if return_iou:
         return md, float(inter / union.clamp_min(1.0))
     return md
@@ -186,9 +196,9 @@ def grow_at_residual(splat, shape, P, N, add, steps, device, seed=0, q_pool=None
     return _refit(merged, shape, P, steps, device, q_pool=q_pool, phi_pool=phi_pool, n_query=n_query)
 
 
-def fit_teacher(P, N, *, n_init=64, md_target=1e-3, res=64, steps_warm=300, steps_refit=80, n_query=2048,
-                grow_add=16, max_grow=3, max_prune=14, max_splats=160, min_keep=8, time_budget_s=45.0,
-                k_dense=50_000, device="cuda", seed=0, verbose=False):
+def fit_teacher(P, N, *, n_init=64, md_target=1e-3, iou_ok=0.7, res=64, steps_warm=300, steps_refit=80,
+                n_query=2048, grow_add=16, max_grow=3, max_prune=14, max_splats=160, min_keep=8,
+                time_budget_s=45.0, k_dense=50_000, device="cuda", seed=0, verbose=False):
     """Optimize the MINIMAL supertoroid-splat set with Minkowski filled-volume distance <= ``md_target``
     (holes respected, GT from cached P+N).  Returns ``(splat, md, iou, status, occ_gt)`` where ``status``
     is ``"ok"`` if the target was met (else ``"hard"`` -- those meshes are gated out of student training).
@@ -230,7 +240,7 @@ def fit_teacher(P, N, *, n_init=64, md_target=1e-3, res=64, steps_warm=300, step
         else:
             break                                                    # cannot shrink further
     md, iou = md_filled_volume(splat, occ_gt, res=res, device=device, return_iou=True)
-    status = "ok" if md <= md_target else "hard"
+    status = "ok" if (md <= md_target or iou >= iou_ok) else "hard"
     return splat, md, iou, status, occ_gt
 
 

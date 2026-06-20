@@ -171,7 +171,6 @@ def md_batch(bs, occ_gt, res=64, bound=1.0, return_iou=False, chunk=8192):
     occupancies ``occ_gt (B,4,res^3)`` (bool).  Same definition as :func:`pat.teacher.md_filled_volume`."""
     base = torch.as_tensor(_T.grid_centers(res, bound), device=bs.device)   # (res^3,3) shared
     occ_gt = occ_gt.to(bs.device)
-    vox = (2.0 * bound / res) ** 3
     sym = torch.zeros(bs.B, device=bs.device)
     inter = torch.zeros(bs.B, device=bs.device); uni = torch.zeros(bs.B, device=bs.device)
     for i, o in enumerate(_T._offsets(res, bound)):
@@ -181,7 +180,7 @@ def md_batch(bs, occ_gt, res=64, bound=1.0, return_iou=False, chunk=8192):
         sym = sym + (occ ^ gt).float().mean(1)
         if return_iou:
             inter = inter + (occ & gt).float().sum(1); uni = uni + (occ | gt).float().sum(1)
-    md = (sym / 4.0) * occ_gt.shape[2] * vox                       # (B,)
+    md = sym / 4.0                                                 # (B,) FRACTION vol(A xor B)/vol(cube)
     if return_iou:
         return md, inter / uni.clamp_min(1.0)
     return md
@@ -240,8 +239,8 @@ def _grow_batch(bs, Pt, Ns_np, need, grow_add, seed):
 # --------------------------------------------------------------------------- #
 #  The batched teacher
 # --------------------------------------------------------------------------- #
-def fit_teacher_batch(Ps, Ns, *, m_init=40, m_max=128, grow_add=16, max_grow=4, md_target=1e-3, res=64,
-                      steps_warm=300, steps_refit=70, n_query=2048,
+def fit_teacher_batch(Ps, Ns, *, m_init=40, m_max=128, grow_add=16, max_grow=4, md_target=1e-3, iou_ok=0.7,
+                      res=64, steps_warm=300, steps_refit=70, n_query=2048,
                       keep_schedule=(0.8, 0.6, 0.45, 0.33, 0.25), min_keep=8,
                       k_dense=50_000, device="cuda", seed=0, lr=1e-2, verbose=False):
     """Optimize ``B = len(Ps)`` meshes' minimal splat sets in parallel.  Returns a list of per-mesh
@@ -279,10 +278,13 @@ def fit_teacher_batch(Ps, Ns, *, m_init=40, m_max=128, grow_add=16, max_grow=4, 
         if verbose:
             print(f"  grow {r+1}: still-need {int(need.sum())}/{B} | max-alive {int(bs.alive.sum(1).max())}", flush=True)
 
-    # speculative prune: remember each mesh's smallest feasible field
+    # speculative prune: remember each mesh's smallest FEASIBLE field. A mesh is feasible if MD <= target
+    # OR IoU >= iou_ok (the absolute MD target is hard to hit on detailed meshes; IoU is the scale-free
+    # quality gate that keeps the prune minimizing splats for well-fit-but-not-perfect meshes too).
     best_rows = bs.param_rows().clone(); best_alive = bs.alive.clone()
-    best_md = md_batch(bs, occ_gt, res=res)
-    best_cnt = torch.where(best_md <= md_target, bs.alive.sum(1), torch.full((B,), 10_000, device=device)).clone()
+    best_md, best_iou = md_batch(bs, occ_gt, res=res, return_iou=True)
+    feas0 = (best_md <= md_target) | (best_iou >= iou_ok)
+    best_cnt = torch.where(feas0, bs.alive.sum(1), torch.full((B,), 10_000, device=device)).clone()
     for f in keep_schedule:
         with torch.no_grad():
             share = bs.surface_ownership(Pt).sum(1).masked_fill(~bs.alive, -1.0)      # (B,M)
@@ -292,14 +294,15 @@ def fit_teacher_batch(Ps, Ns, *, m_init=40, m_max=128, grow_add=16, max_grow=4, 
                 new_alive[b, torch.topk(share[b], int(keep_n[b].item())).indices] = True
             bs.alive = new_alive
         _optimize_batch(bs, qpool, phipool, steps=steps_refit, lr=lr, n_query=n_query, seed=seed + 1)
-        md = md_batch(bs, occ_gt, res=res); cnt = bs.alive.sum(1)
-        improve = (md <= md_target) & (cnt < best_cnt)
+        md, iou = md_batch(bs, occ_gt, res=res, return_iou=True); cnt = bs.alive.sum(1)
+        feasible = (md <= md_target) | (iou >= iou_ok)
+        improve = feasible & (cnt < best_cnt)
         if bool(improve.any()):
             rows_now = bs.param_rows()
             best_rows[improve] = rows_now[improve]; best_alive[improve] = bs.alive[improve]
-            best_md[improve] = md[improve]; best_cnt[improve] = cnt[improve]
+            best_md[improve] = md[improve]; best_iou[improve] = iou[improve]; best_cnt[improve] = cnt[improve]
         if verbose:
-            print(f"  keep {f:.2f}: feasible {(md<=md_target).sum().item()}/{B} "
+            print(f"  keep {f:.2f}: feasible {int(feasible.sum())}/{B} "
                   f"min-cnt {int(best_cnt[best_cnt<10000].min().item()) if (best_cnt<10000).any() else 0}", flush=True)
 
     # assemble per-mesh results from the best feasible field (fall back to full field if none feasible)

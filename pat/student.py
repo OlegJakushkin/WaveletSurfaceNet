@@ -274,21 +274,28 @@ def reconstruct_amortized(P, N, groupnet, fitnet, *, k=24, min_group=8, nms_radi
 # --------------------------------------------------------------------------- #
 #  Training over the cached teacher shards
 # --------------------------------------------------------------------------- #
-def iter_shards(teacher_dir, status_ok_only=True):
-    """Yield loaded teacher artifacts from a sharded teacher cache directory (status=='ok' by default)."""
+def iter_shards(teacher_dir, iou_min=0.0, status_ok_only=False):
+    """Yield loaded teacher artifacts.  Gate on reconstruction quality ``iou >= iou_min`` (the robust,
+    scale-free filter -- a low IoU means a bad teacher example, whether from a poor fit or an unreliable
+    GT on a non-watertight mesh; either way it should not train the student)."""
     for path in sorted(glob.glob(os.path.join(teacher_dir, "shard_*", "mesh_*.pt"))):
         a = torch.load(path, weights_only=False, map_location="cpu")
         if status_ok_only and a.get("status") != "ok":
+            continue
+        if float(a.get("iou", 0.0)) < iou_min:
             continue
         yield a
 
 
 def train_groupnet(teacher_dir, *, epochs=4, lr=1e-3, k=24, d_g=32, device="cuda", log_every=50,
-                   net=None, max_meshes=None):
+                   net=None, max_meshes=None, iou_min=0.0):
     """Train GroupNet on cached teacher ``owner`` labels.  One mesh per step (the points are the batch)."""
     net = (net or GroupNet(d_g=d_g)).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
-    arts = list(iter_shards(teacher_dir))
+    arts = list(iter_shards(teacher_dir, iou_min=iou_min))
+    if not arts:
+        raise ValueError(f"no teacher shards with iou >= {iou_min} in {teacher_dir} -- lower iou_min "
+                         f"(the teacher's IoU distribution is in the QA stats).")
     if max_meshes:
         arts = arts[:max_meshes]
     hist = []
@@ -325,11 +332,13 @@ def _gather_groups(a, device, min_group=6, max_group=256):
 
 
 def train_fitnet(teacher_dir, *, epochs=4, lr=1e-3, batch=32, device="cuda", log_every=50,
-                 net=None, max_meshes=None, p_max=6.0):
+                 net=None, max_meshes=None, p_max=6.0, iou_min=0.0):
     """Train FitNet to map each teacher group -> its splat row (geometry-first loss)."""
     net = (net or FitNet(p_max=p_max)).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
-    arts = list(iter_shards(teacher_dir))
+    arts = list(iter_shards(teacher_dir, iou_min=iou_min))
+    if not arts:
+        raise ValueError(f"no teacher shards with iou >= {iou_min} in {teacher_dir} -- lower iou_min.")
     if max_meshes:
         arts = arts[:max_meshes]
     hist = []
