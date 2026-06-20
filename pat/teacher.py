@@ -72,12 +72,12 @@ class CloudShape:
         self.ds, self.dn = densify_surface(P, N, k_dense, seed)
         self.tree = cKDTree(self.ds)
 
-    def sdf(self, q, chunk=200_000):
+    def sdf(self, q, chunk=500_000):
         q = np.asarray(q, np.float64)
         out = np.empty(len(q), np.float64)
         for a in range(0, len(q), chunk):
             qq = q[a:a + chunk]
-            d, idx = self.tree.query(qq)
+            d, idx = self.tree.query(qq, workers=-1)                        # all CPU cores (KD-tree)
             sign = np.einsum("ij,ij->i", qq - self.ds[idx], self.dn[idx])   # local pseudo-normal sign
             out[a:a + chunk] = np.where(sign >= 0, d, -d)
         return out
@@ -146,19 +146,33 @@ def md_filled_volume(splat, occ_gt, res=128, bound=1.0, device="cuda", return_io
 # --------------------------------------------------------------------------- #
 #  Minimize #splats s.t. MD <= md_target  (over-provision -> warm-fit -> grow -> greedy-prune+refit)
 # --------------------------------------------------------------------------- #
-def _refit(splat, shape, cloud, steps, device, **kw):
+def build_gt_pool(shape, P, n_pool=50_000, bound=1.05, device="cuda", seed=0):
+    """Precompute a GT query pool ON ``device`` ONCE: a band hugging the cloud + a uniform bulk, with
+    ground-truth ``phi`` from the KD-tree (one parallel query).  The optimizer then samples from this
+    pool on-GPU every step instead of a per-step CPU KD-tree query -- the key GPU-utilization fix."""
+    rng = np.random.default_rng(seed)
+    nb = n_pool // 2
+    band = P[rng.integers(0, len(P), nb)] + rng.normal(scale=0.03, size=(nb, 3))
+    bulk = rng.uniform(-bound, bound, size=(n_pool - nb, 3))
+    q = np.concatenate([band, bulk], 0).astype(np.float32)
+    phi = shape.sdf(q).astype(np.float32)                            # ONE parallel KD-tree query
+    return (torch.as_tensor(q, device=device), torch.as_tensor(phi, device=device))
+
+
+def _refit(splat, shape, cloud, steps, device, q_pool=None, phi_pool=None, n_query=2048):
     """Re-optimize an existing splat field WITHOUT FPS re-init (single source of truth: optimize_splats)."""
-    return _S.optimize_splats(splat, shape, cloud, steps=steps, prune_every=0, device=device, **kw)
+    return _S.optimize_splats(splat, shape, cloud, steps=steps, prune_every=0, device=device,
+                              n_query=n_query, q_pool=q_pool, phi_pool=phi_pool)
 
 
-def _drop_and_refit(splat, victim, shape, cloud, steps, device):
+def _drop_and_refit(splat, victim, shape, cloud, steps, device, q_pool=None, phi_pool=None, n_query=2048):
     """Build a fresh field without splat ``victim``, then refit so survivors close the gap."""
     keep = [i for i in range(splat.M) if i != victim]
     cand = SuperToroidSplats.from_rows(splat.param_rows()[keep], p_max=splat.p_max)
-    return _refit(cand, shape, cloud, steps, device)
+    return _refit(cand, shape, cloud, steps, device, q_pool=q_pool, phi_pool=phi_pool, n_query=n_query)
 
 
-def grow_at_residual(splat, shape, P, N, add, steps, device, seed=0):
+def grow_at_residual(splat, shape, P, N, add, steps, device, seed=0, q_pool=None, phi_pool=None, n_query=2048):
     """Add ``add`` splats at the WORST-fit surface points (largest ``|sdf_torch(P)|``), init from
     coeffs there, then refit -- targets under-covered regions when the warm fit missed the target."""
     with torch.no_grad():
@@ -168,37 +182,46 @@ def grow_at_residual(splat, shape, P, N, add, steps, device, seed=0):
     new = _S._init_from_coeffs(P, N, cand[pick], np.full(len(pick), 0.18, np.float32))
     merged = SuperToroidSplats.from_rows(
         torch.cat([splat.param_rows(), new.param_rows()], 0), p_max=splat.p_max)
-    return _refit(merged, shape, P, steps, device)
+    return _refit(merged, shape, P, steps, device, q_pool=q_pool, phi_pool=phi_pool, n_query=n_query)
 
 
-def fit_teacher(P, N, *, n_init=64, md_target=1e-3, res=128, steps_warm=400, steps_refit=150,
-                grow_add=16, max_grow=4, max_splats=160, min_keep=8, time_budget_s=60.0,
+def fit_teacher(P, N, *, n_init=64, md_target=1e-3, res=64, steps_warm=300, steps_refit=80, n_query=2048,
+                grow_add=16, max_grow=3, max_prune=14, max_splats=160, min_keep=8, time_budget_s=45.0,
                 k_dense=50_000, device="cuda", seed=0, verbose=False):
     """Optimize the MINIMAL supertoroid-splat set with Minkowski filled-volume distance <= ``md_target``
     (holes respected, GT from cached P+N).  Returns ``(splat, md, iou, status, occ_gt)`` where ``status``
     is ``"ok"`` if the target was met (else ``"hard"`` -- those meshes are gated out of student training).
+
+    The optimizer runs fully on ``device``: GT occupancy + a query pool are precomputed once, so every
+    optimization step samples on-GPU (no per-step CPU KD-tree).  ``res`` is the MD grid resolution
+    (64 is ~8x cheaper than 128 and adequate for the prune decisions); ``max_prune`` caps the greedy
+    rounds so a stubborn mesh can't run the per-mesh budget dry.
     """
     P = np.asarray(P, np.float32); N = np.asarray(N, np.float32)
     t0 = time.time()
     shape = CloudShape(P, N, k_dense=k_dense, seed=seed)
     occ_gt = gt_occupancy(shape, res=res)
+    qp, pp = build_gt_pool(shape, P, device=device, seed=seed)       # GT pool on GPU (sampled each step)
     # (1) over-provision + warm fit (fit_shape's own pruning ON)
-    splat = fit_shape(shape, P, N, n_init=n_init, steps=steps_warm, prune_every=150,
-                      min_share=0.3, min_keep=min_keep, device=device, seed=seed)
+    splat = fit_shape(shape, P, N, n_init=n_init, steps=steps_warm, prune_every=150, n_query=n_query,
+                      min_share=0.3, min_keep=min_keep, device=device, seed=seed, q_pool=qp, phi_pool=pp)
     md = md_filled_volume(splat, occ_gt, res=res, device=device)
     # (2) grow at residual until target met or budget/round/size cap
     rounds = 0
     while md > md_target and rounds < max_grow and splat.M < max_splats and (time.time() - t0) < time_budget_s:
-        splat = grow_at_residual(splat, shape, P, N, add=grow_add, steps=steps_refit, device=device, seed=seed + rounds)
+        splat = grow_at_residual(splat, shape, P, N, add=grow_add, steps=steps_refit, device=device,
+                                 seed=seed + rounds, q_pool=qp, phi_pool=pp, n_query=n_query)
         md = md_filled_volume(splat, occ_gt, res=res, device=device); rounds += 1
         if verbose:
             print(f"  grow {rounds}: M={splat.M} MD={md:.5f}", flush=True)
     # (3) greedy prune-to-minimum: drop the splat owning the FEWEST surface points (the redundant one;
     #     surface-ownership is robust to window inflation, unlike total_weight), refit, accept iff MD ok
-    while splat.M > min_keep and (time.time() - t0) < time_budget_s:
+    pruned = 0
+    while splat.M > min_keep and pruned < max_prune and (time.time() - t0) < time_budget_s:
         victim = int(splat.surface_ownership(P).sum(0).argmin())
-        cand = _drop_and_refit(splat, victim, shape, P, steps_refit, device)
+        cand = _drop_and_refit(splat, victim, shape, P, steps_refit, device, q_pool=qp, phi_pool=pp, n_query=n_query)
         md_c = md_filled_volume(cand, occ_gt, res=res, device=device)
+        pruned += 1
         if md_c <= md_target:
             splat, md = cand, md_c
             if verbose:

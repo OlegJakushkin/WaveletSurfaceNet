@@ -295,26 +295,38 @@ def reconstruct(splat, res=96, bound=1.0, edge_gamma=0.0):
 
 def optimize_splats(splat, shape, cloud, *, steps=600, lr=1e-2, bound=1.2, n_query=4000,
                     lam_eik=0.05, grow=1e-3, square_reg=0.0, edge_gamma=0.0, prune_every=150,
-                    min_share=0.3, min_keep=12, device="cpu", seed=0, log=None, desc="fit splats"):
+                    min_share=0.3, min_keep=12, device="cpu", seed=0, log=None, desc="fit splats",
+                    q_pool=None, phi_pool=None):
     """Run the splat optimization loop on an EXISTING :class:`SuperToroidSplats` (no FPS re-init).
 
     This is the shared core of :func:`fit_shape` (init + this) and the teacher's *refit-after-delete*
     (``pat.teacher._refit``): deleting a splat reweights its neighbors under the self-normalized blend,
     so the survivors MUST re-optimize -- a delete-and-recheck without refit is unsound.  Mutates and
     returns ``splat``.
+
+    ``q_pool (Npool,3)`` + ``phi_pool (Npool,)`` (precomputed GT, on ``device``): when given, each step
+    SAMPLES queries from the pool on-GPU instead of calling ``shape.sdf`` -- this removes the per-step
+    CPU KD-tree query + CPU<->GPU sync that otherwise starves the GPU (the teacher uses this path).
     """
     splat = splat.to(device)
     cloud = np.asarray(cloud, np.float32)
     opt = torch.optim.Adam(splat.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
+    pooled = q_pool is not None and phi_pool is not None
+    gen = torch.Generator(device=device).manual_seed(seed) if pooled else None
     bar = tqdm(range(steps), desc=desc, leave=False) if _HAVE_TQDM else range(steps)
     for it in bar:
-        nb = n_query // 2
-        band = cloud[rng.integers(0, len(cloud), nb)] + rng.normal(scale=0.03, size=(nb, 3))
-        bulk = rng.uniform(-bound, bound, size=(n_query - nb, 3))
-        q = np.concatenate([band, bulk], 0).astype(np.float32)
-        phi_true = torch.as_tensor(shape.sdf(q), dtype=torch.float32, device=device)
-        qt = torch.tensor(q, dtype=torch.float32, device=device, requires_grad=True)
+        if pooled:                                                 # sample precomputed GT on-GPU (fast)
+            idx = torch.randint(0, q_pool.shape[0], (n_query,), generator=gen, device=device)
+            qt = q_pool[idx].detach().clone().requires_grad_(True)
+            phi_true = phi_pool[idx]
+        else:                                                      # per-step CPU sampling + shape.sdf
+            nb = n_query // 2
+            band = cloud[rng.integers(0, len(cloud), nb)] + rng.normal(scale=0.03, size=(nb, 3))
+            bulk = rng.uniform(-bound, bound, size=(n_query - nb, 3))
+            q = np.concatenate([band, bulk], 0).astype(np.float32)
+            phi_true = torch.as_tensor(shape.sdf(q), dtype=torch.float32, device=device)
+            qt = torch.tensor(q, dtype=torch.float32, device=device, requires_grad=True)
         phi = splat.sdf_torch(qt, edge_gamma=edge_gamma)
         l_dist = (phi - phi_true).abs().mean()
         grad, = torch.autograd.grad(phi.sum(), qt, create_graph=True)
@@ -336,8 +348,8 @@ def optimize_splats(splat, shape, cloud, *, steps=600, lr=1e-2, bound=1.2, n_que
             splat.prune(cloud, min_share=min_share, min_keep=min_keep)
             opt = torch.optim.Adam(splat.parameters(), lr=lr)
         if (it + 1) % 50 == 0 or it == 0:
-            rec = dict(step=it + 1, loss=float(loss), dist=float(l_dist),
-                       eik=float(l_eik), n_splats=int(splat.M))
+            rec = dict(step=it + 1, loss=float(loss.detach()), dist=float(l_dist.detach()),
+                       eik=float(l_eik.detach()), n_splats=int(splat.M))
             if log is not None:
                 log.append(rec)
             if _HAVE_TQDM:
@@ -348,12 +360,13 @@ def optimize_splats(splat, shape, cloud, *, steps=600, lr=1e-2, bound=1.2, n_que
 def fit_shape(shape, cloud, normals, *, n_init=96, steps=600, lr=1e-2, bound=1.2,
               n_query=4000, sigma_init=0.18, lam_eik=0.05, grow=1e-3, square_reg=0.0,
               edge_gamma=0.0, prune_every=150, min_share=0.3, min_keep=12, device="cpu",
-              seed=0, log=None):
+              seed=0, log=None, q_pool=None, phi_pool=None):
     """Optimize an adaptive supertoroid-splat field to a ``shape`` exposing ``.sdf(q)`` (3DGS-style).
 
     Initializes ``n_init`` splats from the :func:`pat.core.coeffs_to_torus` fit at FPS centers, then
     runs :func:`optimize_splats`.  ``log`` (if given) collects per-step ``{step,loss,dist,eik,n_splats}``.
-    Returns the fitted :class:`SuperToroidSplats`.
+    ``q_pool/phi_pool`` (precomputed GT on ``device``) make the loop fully on-GPU.  Returns the fitted
+    :class:`SuperToroidSplats`.
     """
     cloud = np.asarray(cloud, np.float32)
     normals = np.asarray(normals, np.float32)
@@ -363,7 +376,7 @@ def fit_shape(shape, cloud, normals, *, n_init=96, steps=600, lr=1e-2, bound=1.2
     return optimize_splats(splat, shape, cloud, steps=steps, lr=lr, bound=bound, n_query=n_query,
                            lam_eik=lam_eik, grow=grow, square_reg=square_reg, edge_gamma=edge_gamma,
                            prune_every=prune_every, min_share=min_share, min_keep=min_keep,
-                           device=device, seed=seed, log=log)
+                           device=device, seed=seed, log=log, q_pool=q_pool, phi_pool=phi_pool)
 
 
 # --------------------------------------------------------------------------- #
