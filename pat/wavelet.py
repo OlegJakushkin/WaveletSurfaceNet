@@ -325,7 +325,7 @@ def train_wavelet(cache, *, res: int = 32, trunc: float = 0.1, bound: float = 1.
     net.train()
     for ep in range(epochs):
         order = torch.randperm(A, generator=g).tolist()
-        run, nb = 0.0, 0
+        run, nb, skipped = 0.0, 0, 0
         for s in range(0, A, batch):
             idx = torch.as_tensor(order[s:s + batch])
             Pc = P[idx]; Nc = N[idx]                 # (b, dense, 3) on CPU
@@ -342,15 +342,22 @@ def train_wavelet(cache, *, res: int = 32, trunc: float = 0.1, bound: float = 1.
             pred, _c_noisy, c_pred = net(noisy)
             loss, parts = wavelet_loss(pred, clean, c_pred, target_c, lam_wave, lam_grad)
             opt.zero_grad()
+            if not torch.isfinite(loss):              # skip a degenerate batch (don't poison weights)
+                skipped += 1
+                continue
             loss.backward()
+            for p in net.parameters():                # sanitize any NaN/Inf grads before clipping
+                if p.grad is not None:
+                    torch.nan_to_num_(p.grad, 0.0, 0.0, 0.0)
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step()
             run += parts["loss"]; nb += 1
             if log_every and nb % log_every == 0:
                 print(f"  wavelet ep{ep} {min(s + batch, A)}/{A} loss {run / nb:.4f}",
                       flush=True)
-        hist.append({"epoch": ep, "loss": run / max(nb, 1)})
-        print(f"wavelet epoch {ep}: loss {run / max(nb, 1):.4f}", flush=True)
+        hist.append({"epoch": ep, "loss": run / max(nb, 1), "skipped": skipped})
+        print(f"wavelet epoch {ep}: loss {run / max(nb, 1):.4f} | skipped {skipped} bad steps",
+              flush=True)
     return net, hist
 
 

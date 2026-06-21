@@ -129,6 +129,19 @@ def test_train_tori_cache_loss_decreases():
     assert len(hist) == 4 and min(h["loss"] for h in hist) < hist[0]["loss"]
 
 
+def test_train_tori_cache_survives_nan_batch():
+    # a degenerate mesh (NaN in the cloud) must not poison the weights: the proven
+    # train_gpu spike/NaN guard skips that batch and the run finishes finite.
+    cache = _tiny_cache(B=8)
+    cache["P"][0, 0, 0] = float("nan")                 # poison one mesh's cloud
+    net, hist = C.train_tori_cache(cache, k=12, epochs=2, batch=2, n_points=200,
+                                   noise_std=0.0, d_embed=32, n_layers=2,
+                                   log_every=0, device="cpu", seed=1)
+    assert sum(h["skipped"] for h in hist) >= 1        # the poisoned batch was skipped
+    assert np.isfinite(hist[-1]["loss"])               # running loss never went NaN
+    assert all(torch.isfinite(p).all() for p in net.parameters())   # weights stayed finite
+
+
 def test_head_to_head_runs(tmp_path):
     import trimesh
     from pat.shapes import normalize_to_unit_cube

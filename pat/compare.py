@@ -85,19 +85,29 @@ def tori_blend_loss(net, pts, nrm, q, phi_true, k, C=64.0, eik=0.1, chunk=2048,
 
 
 def train_tori_cache(cache, *, k=16, epochs=4, batch=8, n_points=512, noise_std=0.015,
-                     frac_noisy=1.0, lr=8e-4, C=64.0, eik=0.1, device="cpu",
-                     subset=None, supertoroid=False, d_embed=128, n_layers=8,
-                     dropout=0.0, log_every=50, seed=0, net=None):
+                     frac_noisy=1.0, lr=8e-4, C=64.0, eik=0.1, clip=1.0,
+                     spike_factor=3.0, device="cpu", subset=None, supertoroid=False,
+                     d_embed=128, n_layers=8, dropout=0.0, log_every=50, seed=0, net=None):
     """Train the paper's :class:`CoeffNet` on a dense ``{P, N, Q, PHI}`` cache.
 
     Each step draws a random point subset of each cached cloud, adds fresh Gaussian
     noise to a fraction ``frac_noisy`` of its points (the noise-robustness regime of
     Sec. 5; the GT signed distance ``PHI`` is always to the *clean* surface), and
-    minimizes the L1 + eikonal blend loss.  Returns ``(net, history)``.
+    minimizes the L1 + eikonal blend loss.  Returns ``(net, history)`` where each
+    history row carries the epoch's mean loss and the count of skipped bad steps.
 
     Mirrors ``train_gpu.py``'s regime (so it is genuinely "the original tori
     network") but is device-agnostic and trains from the cache only — no analytic
     assets — so it sees exactly the ModelNet40 meshes the wavelet net sees.
+
+    **Spike/NaN guard (essential on real ModelNet40 meshes).**  A single degenerate
+    batch (coincident points, a near-zero curvature → sqrt-gradient blowup, a boxy
+    corner) can produce a non-finite *or* finite-but-huge loss; if it is back-propped,
+    Adam writes a NaN/huge moment the run never recovers from (``clip_grad_norm``
+    sanitizes neither).  So a step is **skipped entirely** when the loss is non-finite
+    or exceeds ``spike_factor`` × the trailing-mean loss, param grads are
+    ``nan_to_num``'d before clipping, and only good steps update the weights /
+    trailing mean — exactly the proven ``train_gpu.py`` recipe.
     """
     P, Nn, Q, PHI = cache["P"], cache["N"], cache["Q"], cache["PHI"]
     A = P.shape[0] if subset is None else min(subset, P.shape[0])
@@ -107,12 +117,15 @@ def train_tori_cache(cache, *, k=16, epochs=4, batch=8, n_points=512, noise_std=
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
     g = torch.Generator().manual_seed(seed)
     hist = []
+    loss_ema = None
     net.train()
     for ep in range(epochs):
         order = torch.randperm(A, generator=g).tolist()
-        run, nb = 0.0, 0
+        run, nb, skipped = 0.0, 0, 0
         for s in range(0, A, batch):
             idx = torch.as_tensor(order[s:s + batch])
+            if len(idx) < 2:                          # blend needs >=2 points per cloud
+                continue
             sub = torch.argsort(torch.rand(len(idx), dense, generator=g), 1)[:, :n_points]
             bi = torch.arange(len(idx))[:, None]
             pts = P[idx][bi, sub].to(device)
@@ -123,15 +136,26 @@ def train_tori_cache(cache, *, k=16, epochs=4, batch=8, n_points=512, noise_std=
             q = Q[idx].to(device); phi_true = PHI[idx].to(device)
             loss, ld, le = tori_blend_loss(net, pts, nrm, q, phi_true, k, C=C, eik=eik)
             opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            opt.step()
-            run += float(loss.detach()); nb += 1
-            if log_every and nb % log_every == 0:
-                print(f"  tori ep{ep} {min(s + batch, A)}/{A} loss {run / nb:.4f}",
+            v = float(loss.detach()) if torch.isfinite(loss) else float("inf")
+            spike = (loss_ema is not None) and (v > spike_factor * loss_ema)
+            if torch.isfinite(loss) and not spike:
+                loss.backward()
+                for p in net.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, 0.0, 0.0, 0.0)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
+                opt.step()
+                loss_ema = v if loss_ema is None else 0.98 * loss_ema + 0.02 * v
+                run += v; nb += 1
+            else:
+                skipped += 1
+            if log_every and nb > 0 and (nb + skipped) % log_every == 0:
+                tail = f" (skipped {skipped})" if skipped else ""
+                print(f"  tori ep{ep} {min(s + batch, A)}/{A} loss {run / nb:.4f}{tail}",
                       flush=True)
-        hist.append({"epoch": ep, "loss": run / max(nb, 1)})
-        print(f"tori epoch {ep}: loss {run / max(nb, 1):.4f}", flush=True)
+        hist.append({"epoch": ep, "loss": run / max(nb, 1), "skipped": skipped})
+        print(f"tori epoch {ep}: loss {run / max(nb, 1):.4f} | skipped {skipped} bad steps",
+              flush=True)
     return net, hist
 
 
