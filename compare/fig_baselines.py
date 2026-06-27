@@ -11,7 +11,7 @@ from core import run_all, draw3d, ORDER
 SHAPES = ["cube", "teapot", "bunny", "knurl", "chair", "guitar", "table"]
 N = 4096
 metrics = {}
-cols = ["GT", "SPSR", "tori", "ours"]                          # figure focuses on watertight methods; BPA kept in metrics.json
+cols = ORDER                                                   # GT | SPSR | BPA | APSS | RIMLS | tori | ours
 fig = plt.figure(figsize=(2.05 * len(cols), 2.2 * len(SHAPES)))
 for i, shape in enumerate(SHAPES):
     gt, P, Np, res = run_all(shape, n=N, noise=0.0, seed=0)

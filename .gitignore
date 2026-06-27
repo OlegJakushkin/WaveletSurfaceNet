@@ -245,3 +245,5 @@ paper/*.synctex.gz
 
 # local-only remote-4090 skill (contains credentials)
 .claude/skills/rdp-4090/
+
+paper/

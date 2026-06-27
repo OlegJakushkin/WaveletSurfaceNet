@@ -57,13 +57,35 @@ def recon_gwn(P, N, res=96):
     return v / (res - 1) * (2 * BOUND) - BOUND, f, dt
 
 
+def _pymeshlab_recon(P, N, which):
+    import pymeshlab as ml
+    ms = ml.MeshSet()
+    ms.add_mesh(ml.Mesh(vertex_matrix=np.asarray(P, np.float64), v_normals_matrix=np.asarray(N, np.float64)))
+    t = time.time()
+    gen = ms.generate_marching_cubes_apss if which == "APSS" else ms.generate_marching_cubes_rimls
+    try:    gen(resolution=128)
+    except Exception:
+        try: gen()
+        except Exception as e: raise e
+    dt = time.time() - t
+    m = ms.current_mesh()
+    return np.asarray(m.vertex_matrix()), np.asarray(m.face_matrix()), dt
+
+
+def recon_apss(P, N):  return _pymeshlab_recon(P, N, "APSS")    # Algebraic Point Set Surfaces (Guennebaud&Gross 2007)
+def recon_rimls(P, N): return _pymeshlab_recon(P, N, "RIMLS")   # Robust Implicit MLS (Oztireli et al. 2009)
+
+
 # name -> (callable, needs-import-module) so the driver can probe availability.
-# NOTE: GWN (point-cloud fast winding number, Barill 2018) is intentionally NOT included: the libigl python
-# binding here only exposes the *mesh* winding number fast_winding_number(V,F,Q), not the point-cloud variant,
-# and we do not reimplement methods.  We compare against the public-library baselines that actually run.
+# NOTE: GWN (point-cloud fast winding number, Barill 2018) is NOT included -- the libigl python binding here
+# only exposes the *mesh* winding number fast_winding_number(V,F,Q), not the point-cloud variant, and we do not
+# reimplement methods.  Research methods without a drop-in public Python library (SHM/signed-heat, SSPD, SHC,
+# NN-VIPSS, regularized winding number) are likewise omitted rather than faked.
 METHODS = {
-    "SPSR": (recon_spsr, "open3d"),
-    "BPA":  (recon_bpa,  "open3d"),
+    "SPSR":  (recon_spsr,  "open3d"),
+    "BPA":   (recon_bpa,   "open3d"),
+    "APSS":  (recon_apss,  "pymeshlab"),
+    "RIMLS": (recon_rimls, "pymeshlab"),
 }
 
 

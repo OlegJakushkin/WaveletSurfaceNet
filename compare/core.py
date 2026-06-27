@@ -15,10 +15,13 @@ _mixed = None
 _tori = None
 
 
+MIXED_CKPT = os.environ.get("MIXED_CKPT", "assets/waveshape_mixed.pt")     # set to ..._v2.pt to benchmark the retrained model
+
+
 def mixed_net():
     global _mixed
     if _mixed is None:
-        ck = torch.load("assets/waveshape_mixed.pt", weights_only=False)
+        ck = torch.load(MIXED_CKPT, weights_only=False)
         _mixed = WV.load_at_res(ck, res=128, bound=BOUND).to(DEV).eval()   # resolution-free: query fine, fair to mesh baselines
     return _mixed
 
@@ -106,6 +109,90 @@ def fscore(v, f, gt, tau=0.05, n=30000):
     return 2 * prec * rec / (prec + rec + 1e-9) * 100
 
 
+def sdf_error(v, f, gt, n=4096, band=0.1, seed=0):
+    """Mean |signed-distance error| to GT (x100), clamped to +/-band -- the metric our training optimises.
+    Only defined where signed distance is (watertight GT); returns nan otherwise.  Computed mesh-to-mesh for
+    every method (signed distance to the reconstructed mesh vs to GT) for an apples-to-apples comparison."""
+    if v is None or not len(f) or not gt.is_watertight:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    q = rng.uniform(-1.0, 1.0, (n, 3))
+    try:
+        gd = np.clip(trimesh.proximity.signed_distance(gt, q), -band, band)
+        rd = np.clip(trimesh.proximity.signed_distance(trimesh.Trimesh(v, f, process=False), q), -band, band)
+    except Exception:
+        return float("nan")
+    return float(np.abs(gd - rd).mean() * 100)
+
+
+def normal_consistency(v, f, gt, n=30000, seed=0):
+    """Mean |cos| between recon-surface normal and nearest-GT-surface normal, both directions (1.0 = perfect).
+    Sign-agnostic so a flipped winding is not penalised."""
+    if v is None or not len(f):
+        return float("nan")
+    rec = trimesh.Trimesh(v, f, process=False)
+    a, fa = trimesh.sample.sample_surface(rec, n); na = rec.face_normals[fa]
+    b, fb = trimesh.sample.sample_surface(gt, n);  nb = gt.face_normals[fb]
+    _, ia = cKDTree(b).query(a); _, ib = cKDTree(a).query(b)
+    nc_ag = np.abs(np.einsum("ij,ij->i", na, nb[ia])).mean()
+    nc_ga = np.abs(np.einsum("ij,ij->i", nb, na[ib])).mean()
+    return float((nc_ag + nc_ga) / 2)
+
+
+def fscore_curve(v, f, gt, taus=(0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1), n=30000, seed=0):
+    """F-score across a sweep of thresholds (one NN-distance pair reused for all taus), plus a tau-independent
+    AUC summary -- answers the reviewer's 'single tau is fragile' point."""
+    if v is None or not len(f):
+        return {float(t): 0.0 for t in taus}, 0.0
+    a = trimesh.Trimesh(v, f, process=False).sample(n); b, _ = trimesh.sample.sample_surface(gt, n)
+    da, _ = cKDTree(b).query(a); db, _ = cKDTree(a).query(b)
+    curve = {}
+    for t in taus:
+        p = float((da < t).mean()); r = float((db < t).mean())
+        curve[float(t)] = 2 * p * r / (p + r + 1e-9) * 100
+    ta = np.array(sorted(curve)); vals = np.array([curve[t] for t in ta])
+    auc = float(np.trapz(vals, ta) / (ta[-1] - ta[0]))
+    return curve, auc
+
+
+def mesh_defects(v, f):
+    """Mesh-quality defects (reviewer's 'component count is not a watertightness proxy' point): boundary/open
+    edges, non-manifold edges, self-intersections, degenerate faces, watertight flag, components, Euler char."""
+    if v is None or not len(f):
+        return dict(boundary_edges=-1, nonmanifold_edges=-1, self_intersections=-1, degenerate=-1,
+                    watertight=False, components=0, euler=0)
+    m = trimesh.Trimesh(v, f, process=False)
+    cnt = np.bincount(m.edges_unique_inverse, minlength=len(m.edges_unique))
+    boundary = int((cnt == 1).sum()); nonmanifold = int((cnt > 2).sum())
+    try: degenerate = int((~m.nondegenerate_faces()).sum())
+    except Exception: degenerate = -1
+    self_x = -1
+    try:
+        import pymeshlab as ml
+        ms = ml.MeshSet(); ms.add_mesh(ml.Mesh(m.vertices, m.faces))
+        ms.apply_filter("compute_selection_by_self_intersections_per_face")
+        self_x = int(ms.current_mesh().selected_face_number())
+    except Exception:
+        pass
+    return dict(boundary_edges=boundary, nonmanifold_edges=nonmanifold, self_intersections=self_x,
+                degenerate=degenerate, watertight=bool(m.is_watertight), components=int(m.body_count),
+                euler=int(m.euler_number))
+
+
+def agg_ci95(rows, method, key):
+    """Mean and t-based 95% CI half-width over per-shape rows (for error bars in the charts)."""
+    xs = np.array([r["methods"][method][key] for r in rows if method in r["methods"]
+                   and isinstance(r["methods"][method].get(key), (int, float))
+                   and np.isfinite(r["methods"][method][key])], float)
+    if xs.size == 0:
+        return float("nan"), float("nan"), 0
+    if xs.size < 2:
+        return float(xs.mean()), 0.0, int(xs.size)
+    from scipy import stats
+    half = float(stats.t.ppf(0.975, xs.size - 1) * xs.std(ddof=1) / np.sqrt(xs.size))
+    return float(xs.mean()), half, int(xs.size)
+
+
 def ncomp(v, f):
     if v is None or not len(f):
         return 0
@@ -129,7 +216,7 @@ def draw3d(ax, v, f, view=(20, -55)):
 
 
 # canonical method order for figures/charts
-ORDER = ["GT", "SPSR", "BPA", "tori", "ours"]
+ORDER = ["GT", "SPSR", "BPA", "APSS", "RIMLS", "tori", "ours"]
 
 
 def run_all(shape, n=2048, noise=0.0, seed=0):
@@ -150,3 +237,39 @@ def run_all(shape, n=2048, noise=0.0, seed=0):
     vt, ft, st = recon_tori(P, N); out["tori"] = pack(vt, ft, st)
     vo, fo, so = recon_ours(P, N); out["ours"] = pack(vo, fo, so)
     return gt, P, N, out
+
+
+def sample_path(path, n=4096, noise=0.0, seed=0):
+    """Sample a cloud from a specific mesh file (for the ModelNet40 validation sweep)."""
+    m = trimesh.load(path, force="mesh"); m.fix_normals()
+    m = S.normalize_to_unit_cube(m)
+    sc = 1.0 / max(np.abs(m.vertices).max(), 1e-6)
+    P, N = E.sample_cloud(m, n=n, noise=0.0, seed=seed)
+    P = (P * sc).astype(np.float64); N = N.astype(np.float64)
+    if noise > 0:
+        P = P + noise * np.random.default_rng(seed).normal(size=P.shape)
+    return trimesh.Trimesh(m.vertices * sc, m.faces, process=False), P, N
+
+
+def run_all_cloud(gt, P, N):
+    """Run GT + every available baseline + tori + ours on an explicit (gt,P,N).  Same packing as run_all."""
+    import baselines as B
+
+    def pack(v, f, sec):
+        return (v, f, sec, chamfer(v, f, gt), fscore(v, f, gt), ncomp(v, f))
+
+    out = {"GT": pack(gt.vertices, gt.faces, 0.0)}
+    for name, fn in B.available().items():
+        try:
+            v, f, sec = fn(P, N); out[name] = pack(v, f, sec)
+        except Exception:
+            out[name] = (None, None, float("nan"), float("nan"), 0.0, 0)
+    vt, ft, st = recon_tori(P, N); out["tori"] = pack(vt, ft, st)
+    vo, fo, so = recon_ours(P, N); out["ours"] = pack(vo, fo, so)
+    return out
+
+
+def thin_fraction(P, N):
+    """Fraction of points the analytic gate flags as thin/open (our own closed-vs-open label)."""
+    import torch as _t
+    return float(WV.point_thinness(_t.tensor(P[None]).float(), _t.tensor(N[None]).float()).mean())
