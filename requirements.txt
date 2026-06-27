@@ -1,15 +1,13 @@
-# Core numerics + the PAT pipeline
+# WaveletSurfaceNet -- unified mixed-base surface model.
+# GPU PyTorch is expected (CUDA). The Docker image installs these on top of the
+# pytorch/pytorch:2.6.0-cuda12.4 base; for a host install, install a CUDA torch first.
 numpy>=1.26
 scipy>=1.11
 torch>=2.2
 
-# Reconstruction + meshes
+# reconstruction + mesh IO
 scikit-image>=0.22      # marching cubes
-trimesh>=4.0            # optional: mesh loading/sampling for the mesh demos
+trimesh>=4.0            # mesh loading / sampling / export
 
-# Visualization ("nmwsharp" stack: Nicholas Sharp's polyscope)
-polyscope>=2.2
-matplotlib>=3.7         # loss curves / 2D plots
-
-# Tests
-pytest>=7.0
+# figures / plots
+matplotlib>=3.7

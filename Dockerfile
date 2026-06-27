@@ -1,7 +1,7 @@
-# CUDA-enabled image for Points as (Super)Tori: train, reconstruct meshes, and
-# run the pretrained models with no host-side Python/CUDA setup.
+# CUDA-enabled image for WaveletSurfaceNet (the unified mixed-base surface model):
+# generate meshes from point clouds and train, with no host-side Python/CUDA setup.
 #
-# Base already ships GPU PyTorch (cu124) matching train_gpu.py / the checkpoints.
+# Base already ships GPU PyTorch (cu124) matching the released checkpoint.
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 # System libs trimesh/scikit-image occasionally want for mesh IO.
@@ -21,5 +21,5 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /workspace
 COPY . /workspace
 
-# Default: show GPU + run the test suite. Override per service in docker-compose.
-CMD ["bash", "-lc", "python -c 'import torch;print(\"CUDA:\", torch.cuda.is_available())' && pytest -q"]
+# Default: show GPU + generate.py usage. Override per service in docker-compose (generate / train / shell).
+CMD ["bash", "-lc", "python -c 'import torch;print(\"CUDA:\", torch.cuda.is_available())' && python generate.py --help"]

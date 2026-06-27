@@ -1,18 +1,18 @@
-# Points as (Super)Tori — CUDA train / reconstruct / test, no host setup needed.
+# WaveletSurfaceNet -- unified mixed-base surface model.  GPU, no host setup needed.
 #
 #   docker compose build
-#   docker compose run --rm train     # train both torus + supertoroid models on the GPU
-#   docker compose run --rm render    # reconstruct meshes + comparison images (uses pretrained)
-#   docker compose run --rm test      # run the test suite
+#   docker compose run --rm generate --shape bunny --out out/bunny.obj
+#   docker compose run --rm train --base mixed --out waveshape_mixed --epochs 6
 #
-# Requires the NVIDIA Container Toolkit on the host. Outputs land in ./assets and
-# ./renders via the bind mount, so trained models and images persist on the host.
+# Requires the NVIDIA Container Toolkit on the host.  The repo is bind-mounted at /workspace,
+# so inputs in assets/ and outputs in out/ live on the host.
 
 x-gpu: &gpu
   build: .
-  image: points-as-supertoroids:latest
+  image: waveshape:latest
   volumes:
     - ./:/workspace
+  shm_size: "8gb"
   deploy:
     resources:
       reservations:
@@ -22,26 +22,48 @@ x-gpu: &gpu
             capabilities: [gpu]
 
 services:
-  # Train BOTH a plain-torus and a supertoroid model on the same dataset (GPU).
-  # >=10k assets, >=5 epochs, per-epoch point/noise re-randomization (50% of points
-  # noiseless), and a 50/50 noisy/clean eval split. The dense cache is built inside
-  # the container (fast analytic sampling; no slow bind-mount mesh I/O).
+  # points / mesh (+ optional region box) -> mesh.  Append generate.py flags after the service name:
+  #   docker compose run --rm generate --shape teapot --out out/teapot.obj
+  #   docker compose run --rm generate --shape knurl --superres --out out/knurl_superres.obj
+  #   docker compose run --rm generate --points my_cloud.npy --out out/mine.obj
+  generate:
+    <<: *gpu
+    entrypoint: ["python", "generate.py"]
+
+  # train the unified mixed-base model on ModelNet40 (expects data/ModelNet40/).  Append train.py flags:
+  #   docker compose run --rm train --base mixed --out waveshape_mixed --epochs 6
   train:
     <<: *gpu
-    command: python train_gpu.py --assets 10000 --epochs 6 --batch 12
+    entrypoint: ["python", "train.py"]
 
-  # Reconstruct meshes + render the torus-vs-supertoroid comparison figures
-  # using the pretrained checkpoints in assets/ (this is "mesh generation").
-  render:
+  # interactive shell in the GPU container (debugging / custom runs)
+  shell:
     <<: *gpu
-    command: python make_renders.py --model assets/pat_supertoroid.pt --res 112
+    entrypoint: ["bash"]
 
-  # Reconstruct a single mesh (OBJ) from a shape's point cloud with the trained model.
-  meshgen:
-    <<: *gpu
-    command: python -m pat.meshgen --shape torus --model assets/pat_supertoroid.pt --out renders/torus.obj
+  # honest comparison vs public-library baselines (Open3D SPSR/BPA, libigl) -- see compare/README.md.
+  #   docker compose run --rm compare compare/fig_baselines.py
+  compare:
+    build:
+      context: .
+      dockerfile: compare/Dockerfile
+    image: waveshape-compare:latest
+    volumes:
+      - ./:/workspace
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["python"]
 
-  # Run the test suite inside the container.
-  test:
+  # ---- wavescene: separate monocular-image -> 3D-scene model (kept in wavescene/) ----
+  wavescene-train:
     <<: *gpu
-    command: pytest -q
+    command: python -m wavescene.train --epochs 40 --batch 2
+  wavescene-eval:
+    <<: *gpu
+    command: python -m wavescene.eval_roster

@@ -1,304 +1,104 @@
-# Points as (Super)Tori
+# WaveletSurfaceNet — a unified mixed-base surface field from a point cloud
 
-A from-scratch Python reimplementation of
+Turn a point cloud (points **+** outward normals) into a clean mesh with a single **unified mixed-base**
+model. A resolution-free point transformer *emits* the multi-scale (Haar-wavelet) coefficients of a distance
+field directly from the points — **no analytic primitive, no input grid, no shape template** — and an
+analytic **per-point gate** picks the right base everywhere:
 
-> **Points as Tori: Fast Pointwise Signed Distance for Point Clouds**
-> Nicole Feng, Ioannis Gkioulekas, Keenan Crane — ACM TOG 2026
-> (inspired by <https://nzfeng.github.io/research/PointsAsTori/index.html>)
+- **closed solids** → a **signed** field → meshed at level 0 → a crisp watertight **solid**;
+- **thin / open shells** → an **unsigned** band → meshed at level 0 → a clean **shell**.
 
-…**extended from tori to supertoroids**, with unit tests, a
-[polyscope](https://polyscope.run) (Nicholas Sharp / "nmwsharp") visual demo, and a
-self-contained PyTorch training notebook for Google Colab.
+One model, one forward, both bases — the base chosen where it matters, per point, at **zero added
+parameters**. A bunny comes back a solid body with thin shell ears; a chair comes back a clean shell.
 
----
+![the principle](paper/figs/principle.png)
 
-## Gallery — torus (not ours; Feng 26) vs supertoroid (ours)
+> *Neither single base suffices: an unsigned field can't make a solid (holey hollow cube); a signed field
+> over-fills an open shell (exploded chair). The mixed model gets both right.*
 
-Each figure follows the paper's comparison layout — **top:** ground-truth surface and the two
-reconstructions (marching cubes of the blended SDF); **bottom:** a slice of the signed-distance
-field with red distance isolines, the zero level set in blue, and the input point cloud as black
-dots. Reconstructions use the GPU-trained networks (`assets/pat_torus.pt`,
-`assets/pat_supertoroid.pt`).
-
-| Stanford bunny (complex asset) | Hole + bolts plate |
-|:---:|:---:|
-| ![bunny](assets/bunny.png) | ![bolts](assets/bolts.png) |
-
-| Cube + cylinder, sampled **with noise** | Sharp corners & **textures** (diamond knurl) |
-|:---:|:---:|
-| ![composite with noise](assets/composite_noise.png) | ![knurled cylinder](assets/textured.png) |
-
-Regenerate with `python make_renders.py` (uses the trained checkpoints in `assets/` if present).
+The full write-up is **[`paper/paper2.pdf`](paper/paper2.pdf)**.
 
 ---
 
-## What the method does
+## Quickstart (Docker + GPU)
 
-Given a point cloud $P=\{\mathbf{p}_i\}_{i=1}^{|P|}$ with unit normals $\{\mathbf{n}_i\}$,
-*Points as Tori* (PAT) produces an **analytic, pointwise signed-distance function** $\phi$ to the
-underlying surface — no global solve, no spatial grid — by:
+Requires Docker with the **NVIDIA Container Toolkit** (a CUDA GPU). No host Python/CUDA setup needed.
 
-1. **Fitting one torus per point** (precompute). A torus has a closed-form SDF and can locally
-   match any second-order surface (sphere, ellipsoid, saddle, cylinder, plane as limits). It is
-   determined from six polynomial coefficients of the local height function via Monge-patch
-   curvatures (paper Sec. 4.1 + App. C). The signed per-point function is
-   $g_i = \mathrm{sign}(T_i)\,\phi_{T_i}$.
-2. **Blending** the $g_i$ with a self-normalized, exponentially-weighted average (Eq. 1 / Eq. 25),
-   where the shift $\sigma_{\mathbf{x}}$ and screening $\lambda_{\mathbf{x}}$ are chosen
-   automatically per query from machine precision (Eq. 26).
+```bash
+docker compose build                                              # one-time
+docker compose run --rm generate --shape bunny --out out/bunny.obj
+```
 
-The torus SDF (Eq. 23, with center $\mathbf{c}$, axis $\mathbf{u}$, major radius $R$, minor radius
-$r$) and the blend are
+The released checkpoint is `assets/waveshape_mixed.pt`; output meshes land in `out/` on the host.
 
-$$\phi_T(\mathbf{x}) = \Big\lVert\big(\,\lVert(\mathbf{x}-\mathbf{c})\times\mathbf{u}\rVert - R,\ \ \langle\mathbf{x}-\mathbf{c},\,\mathbf{u}\rangle\,\big)\Big\rVert - r$$
+### The examples
 
-$$\phi(\mathbf{x}) = \frac{\displaystyle\sum_{i=1}^{|P|} g_i(\mathbf{x})\, e^{-\lambda_{\mathbf{x}}\left(\lVert\mathbf{x}-\mathbf{p}_i\rVert-\sigma_{\mathbf{x}}\right)}}{\displaystyle\sum_{i=1}^{|P|} e^{-\lambda_{\mathbf{x}}\left(\lVert\mathbf{x}-\mathbf{p}_i\rVert-\sigma_{\mathbf{x}}\right)}}, \qquad \sigma_{\mathbf{x}}=\tfrac{1}{2}\max_i\lVert\mathbf{x}-\mathbf{p}_i\rVert, \qquad \lambda_{\mathbf{x}}=\frac{C}{\sigma_{\mathbf{x}}},\quad C=64$$
+```bash
+# closed solids  (signed path -> crisp solids)
+docker compose run --rm generate --shape bunny  --out out/bunny.obj
+docker compose run --rm generate --shape teapot --out out/teapot.obj
 
-The six coefficients are produced either by **least squares** (training-free, the default — works
-great on clean data, brittle on curved/real data exactly as the paper's Fig. 3 shows) or by a
-small **Transformer** trained once and reused across shapes (Sec. 4.3).
+# open shell     (unsigned path -> clean shell)
+docker compose run --rm generate --shape chair  --out out/chair.obj
 
-### The supertoroid extension (this repo's addition)
+# context + dense SUPER-RESOLUTION on the knurled cylinder
+#   --region   : reconstruct one surface box as part of the full pass (coarse)
+#   --superres : same box, box-normalised with the whole shape as global context (several x the detail)
+docker compose run --rm generate --shape knurl --region   --out out/knurl_region.obj
+docker compose run --rm generate --shape knurl --superres --out out/knurl_superres.obj
+```
 
-The paper uses ordinary tori, whose ring and tube cross-sections are **circles**. We generalize
-each cross-section to an $L^p$ **super-ellipse** with two squareness exponents
-$p_{\text{ring}}, p_{\text{tube}}$. With the $L^p$ norm
-$\lVert(x,y)\rVert_p = \big(|x|^p+|y|^p\big)^{1/p}$, the in-plane coordinates $(a,b)$ (in the plane
-$\perp\mathbf{u}$) and the axial coordinate $z_{\!\parallel}=\langle\mathbf{x}-\mathbf{c},\mathbf{u}\rangle$:
+### Your own input
 
-$$\rho = \big\lVert(a,b)\big\rVert_{p_{\text{ring}}}, \qquad \phi_{\text{super}}(\mathbf{x}) = \big\lVert(\rho - R,\ z_{\!\parallel})\big\rVert_{p_{\text{tube}}} - r$$
+```bash
+# from any mesh (a cloud is sampled from its surface)
+docker compose run --rm generate --mesh path/to/shape.obj --out out/shape.obj
 
-* $p=2$ reproduces the paper's torus **exactly** — the torus is a strict special case, so a
-  trained torus model is contained in the supertoroid model.
-* $p>2$ gives boxy, rounded-square cross-sections that an ordinary torus cannot represent. These
-  help on shapes with flat faces / boxy edges, where a circular tube cannot sit flush.
+# from a raw point cloud: a .npy of shape (N, 6) = xyz + outward unit normal per row
+docker compose run --rm generate --points my_cloud.npy --out out/mine.obj
+```
 
-This is an *approximate* radial SDF for $p\neq 2$ (exact at $p=2$), which is all the blending
-framework — itself an approximation — needs. It is fully differentiable, so the squareness can be
-learned/optimized alongside the coefficients.
+`generate.py` flags: `--shape {cube,sphere,torus,bunny,teapot,chair,knurl}` | `--mesh PATH` | `--points PATH`,
+plus `--out PATH`, `--region`, `--superres`, `--res N` (output lattice, default 64), `--ckpt PATH`. Run
+`docker compose run --rm generate --help` for all options. (To run on a bare host instead of Compose:
+`python generate.py --shape bunny --out out/bunny.obj`.)
 
 ---
 
 ## Repository layout
 
-```
-pat/
-  core.py        differentiable torus & supertoroid SDFs, coeff→params fit, blending (Eq. 23–26)
-  shapes.py      analytic SDF primitives + samplers (exact ground truth): Sphere, Torus,
-                 SuperToroid, RoundedBox, Plane; plus mesh sampling
-  neighbors.py   k-NN neighborhoods + the R^6 per-point features (Sec. 4.3)
-  lstsq.py       training-free least-squares coefficient estimator (the "naive" baseline)
-  model.py       CoeffNet — the Transformer coefficient predictor (Sec. 4.3, Fig. 15)
-  train.py       query sampling + L1/eikonal blend loss (Eq. 27)  [shared with the notebook]
-  pat.py         PAT — point cloud → callable SDF + marching-cubes reconstruction (Algorithm 1)
-  baselines.py   SSPD (Eq. 29) and signed Hopf-Cole (Eq. 28) comparisons
-  optimize.py    per-cloud torus-vs-supertoroid optimization + comparison (item 3)
-  viz.py         polyscope visualization (lazy, headless-safe)
-tests/           pytest suite (numeric correctness, no GUI)
-notebooks/
-  train_pat_colab.ipynb   self-contained PyTorch training notebook (item 4)
-demo.py          interactive polyscope demo
-```
-
-Everything numerical lives once, in PyTorch, in `pat/core.py`, so inference, tests and
-training share identical code — a model trained in the notebook plugs into every path.
+| path | what |
+|------|------|
+| `waveshape/`  | the model package — `wavelet.py` (the `PerceiverWaveNet` + `load_at_res` + meshing), plus the geometry support it needs. Self-contained: numpy + torch. |
+| `generate.py` | the CLI above: points / mesh (+ optional region box) → mesh. |
+| `train.py`    | train the model on ModelNet40 (see below). |
+| `assets/`     | the released checkpoint `waveshape_mixed.pt` + the example inputs (bunny, teapot, one ModelNet chair). |
+| `paper/`      | the paper — `paper2.tex` / `paper2.pdf` (+ figures). Build with `sh paper/render.sh`. |
+| `tori/`       | the original **Points-as-Tori** model (the baseline we compare against), isolated and runnable — see [`tori/README.md`](tori/README.md). |
+| `wavescene/`  | a separate monocular-image → 3D-scene model (its own project; kept here for convenience). |
 
 ---
 
-## Install & run
+## Training (optional — the checkpoint already ships)
+
+Training needs `data/ModelNet40/` on the host. The unified mixed-base model:
 
 ```bash
-pip install -r requirements.txt
-
-# run the test suite (headless, ~1–2 min on CPU)
-pytest -q
-
-# interactive demo (needs a display)
-python demo.py --shape supertoroid          # torus fit
-python demo.py --shape supertoroid --supertoroid --p-tube 4   # supertoroid fit
-python demo.py --shape rbox --compare       # optimize torus vs supertoroid, print errors
-python demo.py --model notebooks/pat_supertoroid.pt   # use a trained checkpoint
+docker compose run --rm train --base mixed --out waveshape_mixed --region --epochs 6
 ```
 
-Minimal API:
-
-```python
-import numpy as np
-from pat import PAT
-from pat.shapes import SuperToroid
-
-pts, nrm = SuperToroid(R=0.6, r=0.28, p_tube=4.0).sample_surface(2048, np.random.default_rng(0))
-pat = PAT(pts, nrm)                  # least-squares tori (no training needed)
-d   = pat.sdf(np.zeros((1, 3)))      # signed distance at a query point
-V, F = pat.reconstruct(res=96)       # marching-cubes mesh of the zero level set
-```
+`--base {signed,unsigned,mixed}` selects the field the model is anchored on and trained toward; `--region`
+trains the context+dense super-resolution path. Checkpoints are written to `assets/<out>.pt` (best by
+validation) and `assets/<out>_latest.pt`.
 
 ---
 
-## Torus vs. supertoroid (item 3)
+## The tori baseline
 
-`pat.optimize.compare_torus_vs_supertoroid` fits a torus first, then **warm-starts the
-supertoroid from the torus's coefficients and optimizes only the cross-section squareness**
-(with a mild `p → 2` regularizer). Because it begins exactly at the torus optimum and shares
-the query stream, the supertoroid can only match or beat the torus. Mean-abs SDF error on a
-grid over `[-1, 1]^3` (300-point clouds, 120 steps; reproduce with `demo.py --compare`):
+The `tori/` folder holds the from-scratch reimplementation of *Points as Tori* (Feng, Gkioulekas & Crane,
+ACM TOG 2026) extended to supertoroids — the fixed-primitive baseline. It is fully self-contained; see
+[`tori/README.md`](tori/README.md) to run it.
 
-| target shape           | torus err | supertoroid err | improvement | learned p_tube |
-|------------------------|-----------|-----------------|-------------|----------------|
-| SuperToroid (p_tube=4) | 0.0262    | 0.0230          | **+12.0%**  | 2.10 (boxier)  |
-| RoundedBox             | 0.0327    | 0.0317          | +3.0%       | 1.98           |
-| Torus                  | 0.0044    | 0.0041          | +7.3%       | 2.02           |
-| Sphere                 | 0.0009    | 0.0006          | +27.0%      | 2.00 (≈ torus) |
+## License
 
-The squareness genuinely moves away from `p = 2` only on the boxy supertoroid target; on
-round shapes it stays at a torus. The robust, training-free statement is **expressiveness**:
-with the correct squareness supplied on *exact* base tori, a supertoroid blend is `>3×`
-closer to a boxy supertoroid target than a torus blend
-(`tests/test_supertoroid.py::test_supertoroid_more_expressive_than_torus_with_exact_base`).
-
----
-
-## Comparison figures (Fig. 8 / Fig. 17 style)
-
-`make_renders.py` reproduces the paper's comparison layout (see the Gallery above) for six
-assets, all rendered as **torus (not ours; Feng 26) vs supertoroid (ours)** — by default using the two trained
-networks in `assets/`:
-
-```bash
-python make_renders.py                       # uses assets/pat_torus.pt + assets/pat_supertoroid.pt
-python make_renders.py --fast                # training-free: least-squares torus + squareness-only
-```
-
-| figure | asset | notes |
-|--------|-------|-------|
-| `assets/buckyball.png`       | C60 / truncated-icosahedron lattice (`pat.assets.Buckyball`) | 60 joints, 90 rounded tubes |
-| `assets/cube.png`            | sharp cube (`pat.assets.Cube`) | flat faces / sharp edges |
-| `assets/bunny.png`           | Stanford bunny (`pat.bunny.MeshShape`) | complex traditional asset, exact mesh SDF |
-| `assets/composite_noise.png` | box + cylinder boss + bored cylinder (`pat.assets.BoxWithCylinders`), **with noise** | the noisy-cloud figure |
-| `assets/bolts.png`           | rounded plate with through-holes + inserted bolts (`pat.assets.BoltPlate`) | the "hole + bolts" part |
-| `assets/textured.png`        | diamond-knurled handle (`pat.assets.TexturedCylinder`) | sharp corners + repeating **texture** (the barbell knurl) |
-
-New analytic SDF assets live in `pat/assets.py` (validated: surface error ~0); the bunny is a
-ground-truth `MeshShape` in `pat/bunny.py`.
-
----
-
-## Training — Docker + GPU only (item 4)
-
-**Policy (enforced by the `train-gpu-docker` skill): training is always run inside Docker and
-always on the GPU.** `train_gpu.py` aborts if CUDA is unavailable; the Compose `train` service
-reserves the NVIDIA GPU. It trains **both** a plain-torus model and a supertoroid model on **one
-shared dataset** that deliberately explores the supertoroid's extra subsurfaces (supertoroids
-with a wide range of squareness, plus the sharp/faceted cube, knurled cylinder and bolt plate),
-mixed with **40,000 real meshes drawn style-stratified from the Objaverse++ high-quality subset**
-(the [Objaverse++](https://github.com/TCXX/ObjaversePlusPlus) quality annotations keep only
-*High*/*Superior* objects), all with input noise. The notebook filters by quality, draws a diverse
-40k (`pat.datasets.stratified_sample`), and streams the `.glb` meshes no-auth via the `objaverse`
-package. `pat.datasets.mesh_index` also finds any real-mesh corpus in `data/` (`.off`/`.obj`/`.glb`),
-so the trainer is dataset-agnostic; mix real meshes in with `--meshes N --mesh-root data` or feed a
-pre-built `--mesh-cache-file`.
-
-**Network (`CoeffNet`).** The coefficient predictor is a ~2× wider transformer than the paper's
-default — `d_embed=192, n_layers=6, n_heads=12, d_ff=672` (~2.06× the parameters). Width, not
-depth: at the `k+1=17`-token neighborhood the transformer is launch/memory-bound, so widening
-~doubles capacity while **depth (the latency driver) is held**, keeping it as snappy per
-neighborhood. The supertoroid's squareness exponent is **capped** (`p_max=6`) and trained with an
-annealed `p→2` regularizer, **LR warmup + cosine**, per-net/per-head grad clipping, a
-finite-loss-spike skip, and **weight EMA** — which together cure the squareness-runaway that made
-the earlier supertoroid val spike and stall around epoch 4–5.
-
-### How the loss is computed (Eq. 27)
-
-For a batch of clouds with $Q$ query points $\mathbf{q}_j$ each, the predicted blended SDF $\phi$
-is fit to the ground-truth distance $\phi_{\text{true}}$ — distance to the **clean** surface, even
-though the input cloud is noisy — with an $L_1$ term, plus an **eikonal** term that pushes the
-field's gradient to unit norm (a true SDF satisfies $\lVert\nabla\phi\rVert=1$). The spatial
-gradient $\nabla_{\mathbf{x}}\phi$ is taken by autograd *through* the blend, so the eikonal term is
-differentiable in the network weights:
-
-$$\mathcal{L} = \mathcal{L}_{\text{dist}} + \beta\,\mathcal{L}_{\text{eik}}, \qquad \mathcal{L}_{\text{dist}} = \frac{1}{Q}\sum_{j=1}^{Q}\big|\,\phi(\mathbf{q}_j) - \phi_{\text{true}}(\mathbf{q}_j)\,\big|, \qquad \mathcal{L}_{\text{eik}} = \frac{1}{Q}\sum_{j=1}^{Q}\Big|\,1 - \big\lVert\nabla_{\mathbf{x}}\phi(\mathbf{q}_j)\big\rVert\,\Big|$$
-
-with $\beta = 0.1$. The reduction is a mean over **all** $B\times Q$ queries in the batch (clouds
-$\times$ queries). The plain-torus and supertoroid networks each minimize $\mathcal{L}$ on the
-*same* batch with their **own** AdamW optimizer (one `backward()` + step per network per batch; no
-gradient accumulation across batches), and any non-finite step is skipped so a degenerate batch
-cannot NaN-poison the weights.
-
-```bash
-docker compose build
-docker compose run --rm train     # -> assets/pat_torus.pt, assets/pat_supertoroid.pt
-docker compose run --rm render    # regenerate the comparison figures with the trained models
-docker compose run --rm test      # run the test suite (incl. the torus-reconstruction check)
-```
-
-Live progress is logged per step (running loss, it/s, ETA) and per epoch — the **val-torus-err**
-and **val-cube-err** (mean abs SDF error reconstructing a default torus and a sharp flat-sided
-cube) plus the 50/50 clean/noisy held-out eval. The acceptance bar is **val-torus-err < 0.01 for
-both models** — small enough that the default-torus reconstruction error is invisible by eye
-(`tests/test_validation.py`). The real-data pipeline lives in `pat/datasets.py`.
-
-### Reading the training curves (`assets/training_curves.png`)
-
-Training writes `assets/training_curves.png` (regenerated each run; **left:** reconstruct a default
-torus / sharp cube — **right:** held-out 50% clean / 50% noisy eval):
-
-![training curves](assets/training_curves.png)
-
-Two implications to read off it:
-
-* **The plain torus overfits; the supertoroid does not.** On boxy data (CAD parts + the cube /
-  knurl / bolt + $p\neq 2$ supertoroids) the torus is stuck at $p=2$, so it can only push training
-  loss down by **contorting its curvature coefficients** to fake flat/boxy regions — which does not
-  generalize, so its val/eval curves bend **back up** after a couple of epochs. The supertoroid has
-  the matching squareness DOF, fits the boxy data honestly, and keeps improving — **its extra
-  expressiveness doubles as regularization.** We further curb the torus with **weight decay +
-  dropout** and ship the **best-by-val** epoch (early stopping), so the *saved* model is the
-  pre-overfit one even when the last epoch is worse.
-* **The cube is where the supertoroid wins most.** `val-cube-err` is consistently lower for the
-  supertoroid: a circular tube cannot sit flush against a flat face, a rounded-square one can. On
-  the round torus and on the clean/noisy eval the two are close; the gap opens on **sharp / flat**
-  geometry — which is the whole point of the extension.
-
-The Colab notebook `notebooks/train_pat_colab.ipynb` mirrors this for a hosted GPU (with a
-`DATA_MODE = 'synthetic' | 'modelnet'` switch) and saves a plain `state_dict` + config.
-
-Because every path trains the *same* `CoeffNet` the library uses, a checkpoint plugs into all
-other code and tests with no glue:
-
-```python
-import torch
-from pat import PAT
-from pat.model import CoeffNet
-ck = torch.load("pat_supertoroid.pt", map_location="cpu")
-model = CoeffNet(**ck["config"]); model.load_state_dict(ck["state_dict"])
-pat = PAT(points, normals, model=model)
-```
-
----
-
-## Notes & limitations
-
-* The torus SDF and the blend are exact (validated to ~1e-7 against analytic SDFs). The
-  accuracy bottleneck of the training-free path is **curvature estimation** from least
-  squares — precisely the brittleness the paper motivates learning to fix (Fig. 3).
-* The supertoroid SDF is an exact distance only at $p=2$; for $p\neq 2$ it is the standard
-  radial $L^p$ approximation, smooth and differentiable.
-* This is a research-grade reimplementation focused on the core method, the supertoroid
-  extension, tests and training — not the paper's optimized C++/JAX inference, large-scale
-  data pipeline, or the full evaluation against SPSR/NN-VIPSS/SHM.
-
----
-
-## References
-
-The method reimplemented here:
-
-> Nicole Feng, Ioannis Gkioulekas, and Keenan Crane. 2026. **Points as Tori: Fast Pointwise
-> Signed Distance for Point Clouds.** *ACM Transactions on Graphics* 45, 4, Article 53 (July
-> 2026), 24 pages. <https://doi.org/10.1145/3811385>
-> Project page: <https://nzfeng.github.io/research/PointsAsTori/index.html>
-
-Data / assets used for evaluation (under their own terms, research use only): the **Stanford
-Bunny** (Stanford Computer Graphics Laboratory) and **ModelNet40** (Princeton). Visualization
-uses **polyscope** (Nicholas Sharp).
-
+See [`LICENSE`](LICENSE).

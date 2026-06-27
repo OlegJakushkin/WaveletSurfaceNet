@@ -3,6 +3,10 @@ data/
 **/__pycache__/
 *.pyc
 .git/
-PointsAsTori.pdf
-_paper_text.txt
 .pytest_cache/
+_archive/
+out/
+paper/
+notebooks/
+renders/
+.claude/

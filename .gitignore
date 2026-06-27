@@ -221,14 +221,27 @@ data/ModelNet40/
 
 *.zip
 
-# Points-as-(Super)Tori generated artifacts.
-# data/ holds ModelNet40 + dense caches; *cache*.pt are caches; assets/_* are temp runs.
-# assets/pat_*.pt, assets/*.png and assets/*.json stay tracked, so the whole assets/
-# folder (trained models + figures + curves) can be copied back to update the repo.
+# WaveletSurfaceNet generated / local artifacts.
+# data/ holds ModelNet40 + dense caches (21GB); *cache*.pt are caches; assets/_* are temp runs.
 data/
 *.host.bak
 _paper_text.txt
 *cache*.pt
 assets/_*
 
-paper/
+# generated mesh outputs from generate.py
+out/
+
+# archived experiment scripts / old renders / intermediate checkpoints (kept locally, out of the release)
+_archive/
+_dlmodels/
+
+# LaTeX build artifacts (paper/ SOURCE + paper2.pdf are tracked)
+paper/*.aux
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.out
+paper/*.synctex.gz
+
+# local-only remote-4090 skill (contains credentials)
+.claude/skills/rdp-4090/
