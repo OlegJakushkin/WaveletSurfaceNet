@@ -1,0 +1,1 @@
+{"run": "local", "model": "waveshape_mixed.pt (v1, stable)", "val_k": 2, "host": "RTX 3080 8GB"}

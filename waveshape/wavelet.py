@@ -631,7 +631,8 @@ def _smooth_grid(grid, sigma: float = 0.8):
 
 def wavelet_surface_loss(pred, clean, c_clean, target_c, seg_logits=None, seg_label=None,
                          lam_wave: float = 0.3, lam_grad: float = 0.05, lam_seg: float = 0.05,
-                         lam_smooth: float = 0.1, lam_sign: float = 0.25, lam_conn: float = 0.0):
+                         lam_smooth: float = 0.1, lam_sign: float = 0.25, lam_conn: float = 0.0,
+                         lam_geo: float = 0.0):
     """Composite best-loss for :class:`WaveletSurfaceNet`.
 
     Terms: field smooth-L1 + wavelet-coeff L1 + gradient + a CONTINUITY/de-speckle penalty (per-voxel
@@ -656,6 +657,17 @@ def wavelet_surface_loss(pred, clean, c_clean, target_c, seg_logits=None, seg_la
         L = L + lam_conn * F.relu(-pred * phi_co).mean()
     if seg_logits is not None and seg_label is not None:
         L = L + lam_seg * F.binary_cross_entropy_with_logits(seg_logits, seg_label)
+    # ---- geometry-quality block: differentiable FIELD proxies for the mesh metrics where ours is weak ----
+    # (lam_geo scales the whole block to lam_geo x the base loss above, so lam_geo=0.5 == "+50% impact").
+    if lam_geo:
+        far = (clean.abs() >= 0.4).float()                          # CHAMFER / #COMPONENTS / SELF-X: no spurious
+        l_float = (F.relu(0.15 - pred.abs()) * far).mean()          #   zero-crossing where clean is clearly in/out (floaters)
+        band = (clean.abs() < 0.30).float()                         # HOLES / #COMPONENTS: de-speckle the near-surface
+        l_band = ((pred - F.avg_pool3d(pred, 3, stride=1, padding=1)).abs() * band).mean()   # band (pinholes/fragments)
+        interior = (clean < -0.1).float()                           # F-CLOSED: sharper interior -> crisper closed solids
+        l_closed = (F.smooth_l1_loss(pred, clean, beta=0.1, reduction="none") * interior).mean()  # (open shells have none)
+        l_geo = l_float + l_band + l_closed
+        L = L + lam_geo * (L.detach() / (l_geo.detach() + 1e-6)) * l_geo
     return L
 
 

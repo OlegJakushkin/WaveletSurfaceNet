@@ -1,0 +1,16 @@
+v1 = assets/waveshape_mixed.pt   v2 = assets/waveshape_mixed_v2.pt
+
+Traceback (most recent call last):
+  File "/content/wsn/compare/check_v2.py", line 31, in <module>
+    a = run("assets/waveshape_mixed.pt")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/content/wsn/compare/check_v2.py", line 15, in run
+    gt, P, N = core.sample(s, n=4096)
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "/content/wsn/compare/core.py", line 57, in sample
+    m = get_mesh(c)
+        ^^^^^^^^^^^
+  File "/content/wsn/compare/core.py", line 50, in get_mesh
+    m = trimesh.load(sorted(glob.glob(f"data/ModelNet40/{c}/test/*.off"))[0], force="mesh"); m.fix_normals()
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+IndexError: list index out of range

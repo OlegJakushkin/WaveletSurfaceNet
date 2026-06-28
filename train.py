@@ -32,12 +32,12 @@ from waveshape.bunny import load_bunny
 
 dev = "cuda"; bound = 1.1; RES = 64; TRUNC = 0.1; DENSE = 1536   # RES = training/output lattice only; the net is res-free (query any res via WV.load_at_res)
 NOISE_LO, NOISE_HI = 0.0, 0.10
-NOISE_MAX = 0.15                                    # v2: the noisy draw uses a RANDOM level in [0.02, NOISE_MAX]
-DMIN = 384                                          # v2: per-step density subsample in [DMIN, DENSE] (sparsity aug)
 DRAWS = 2; LR = 2e-3; BASE = 40; SEED = 0; NVAL = 4; CLEAN_SAMPLE = 128
-LAM_WAVE, LAM_GRAD, LAM_SEG = 0.4, 0.05, 0.05      # target-aware wavelet term up (preserves texture)
-LAM_SMOOTH, LAM_SIGN = 0.10, 0.40                  # v2: stronger de-speckle + anti-floater (WATERTIGHTNESS)
-LAM_CONN = 0.6                                      # v2: stronger connectivity -- detail may NOT tear the coarse body
+LAM_WAVE, LAM_GRAD, LAM_SEG = 0.4, 0.05, 0.05      # target-aware wavelet term (preserves texture)
+LAM_SMOOTH, LAM_SIGN = 0.05, 0.30                  # v1 recipe (v2's boost measured WORSE on every metric -> reverted)
+LAM_CONN = 0.4
+LAM_GEO = 0.5                                       # NEW geometry-quality block at +50% of base loss: targets
+#                                                    Chamfer/floaters, #components, holes, F-closed (see wavelet_surface_loss)
 UDF_BAND_VOX = 0.7                                  # UDF mode: MC band in VOXELS (the field floor is ~half a voxel at any res)
 CTX_MIN, CTX_MAX = 16, 104                          # FLEXIBLE 128-token budget: the context/main split (n_ctx) is a free
                                                     # deploy-time choice; randomising it per step here teaches the net to read ANY division
@@ -189,7 +189,7 @@ def main():
     ap.add_argument("--out", default="waveshape", help="checkpoint basename under assets/ (e.g. waveshape_udf)")
     ap.add_argument("--solids", type=int, default=0, help="mix in N synthetic flat-faced solids (clean flat-face fields for UDF)")
     # loss-term ablations (reviewer): override a weight; <0 keeps the default constant. e.g. --lam-conn 0 drops connectivity.
-    for _t in ("wave", "grad", "smooth", "sign", "conn", "seg"):
+    for _t in ("wave", "grad", "smooth", "sign", "conn", "seg", "geo"):
         ap.add_argument(f"--lam-{_t}", type=float, default=-1.0, help=f"ablation: override LAM_{_t.upper()} (>=0)")
     a = ap.parse_args()
     base = a.base or ("unsigned" if a.unsigned else "signed")
@@ -207,6 +207,7 @@ def main():
     lam_grad = a.lam_grad if a.lam_grad >= 0 else LAM_GRAD
     lam_smooth = a.lam_smooth if a.lam_smooth >= 0 else LAM_SMOOTH
     lam_seg = a.lam_seg if a.lam_seg >= 0 else LAM_SEG
+    lam_geo = a.lam_geo if a.lam_geo >= 0 else LAM_GEO        # geometry-quality block (Chamfer/holes/#comp/F-closed)
     lam_sign = 0.0 if base == "unsigned" else (a.lam_sign if a.lam_sign >= 0 else LAM_SIGN)   # signed-only terms
     lam_conn = 0.0 if base == "unsigned" else (a.lam_conn if a.lam_conn >= 0 else LAM_CONN)
     os.makedirs("renders", exist_ok=True)
@@ -326,18 +327,16 @@ def main():
                     Pt_ = (Pc - center) * (bound / half)              # box-local cloud -> target frame
                 clean = WV.tsdf_from_clouds(Pt_, Nc, res, trunc, bound, dev, mode=base) / trunc
                 tc = WV.dwt3d(clean, haar)
-                ns = torch.empty(Bc, 1, 1, device=dev).uniform_(0.02, NOISE_MAX)  # v2: noisy draw = RANDOM level
-                ns[:len(ii)] = NOISE_LO                               # draw 0 = clean, draw 1 = U[0.02,NOISE_MAX] noise
+                ns = torch.full((Bc, 1, 1), NOISE_HI, device=dev)      # noise aug: each mesh twice --
+                ns[:len(ii)] = NOISE_LO                               # draw 0 = clean, draw 1 = 10% noise (diff region)
                 Pn = Pc + torch.randn(Pc.shape, device=dev) * ns       # noisy cloud -> resolution-free input
                 seg_label = WV.wavelet_side_labels(tc) if with_seg else None
             # FLEXIBLE 128-token split: draw a fresh context/main division [CTX_MIN, CTX_MAX] every step so the
             # network learns to read any [context | SEP | main] partition, not one fixed n_ctx.
             nctx = int(torch.randint(CTX_MIN, CTX_MAX + 1, (1,), generator=g).item())
-            nsub = int(torch.randint(DMIN, DENSE + 1, (1,), generator=g).item())   # v2: sparsity aug -- random input density
-            Pin, Nin = Pn[:, :nsub], Nc[:, :nsub]                                   # cloud is random-ordered -> random subsample
-            pred, c_anchor, c_clean, seg = net(Pin, Nin, ctx_P=Pin, ctx_N=Nin, center=center, half=half, n_ctx=nctx)
+            pred, c_anchor, c_clean, seg = net(Pn, Nc, ctx_P=Pn, ctx_N=Nc, center=center, half=half, n_ctx=nctx)
             loss = WV.wavelet_surface_loss(pred, clean, c_clean, tc, seg, seg_label,
-                                           lam_wave, lam_grad, lam_seg, lam_smooth, lam_sign, lam_conn)
+                                           lam_wave, lam_grad, lam_seg, lam_smooth, lam_sign, lam_conn, lam_geo)
             opt.zero_grad()
             if torch.isfinite(loss) and (nb < 5 or loss < 3 * (run / max(nb, 1))):
                 loss.backward()

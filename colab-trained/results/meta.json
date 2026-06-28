@@ -1,0 +1,6 @@
+{
+ "run": "colab",
+ "model": "waveshape_mixed_v2",
+ "val_k": 3,
+ "date": "2026-06-27T16:06"
+}

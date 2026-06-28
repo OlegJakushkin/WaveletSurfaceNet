@@ -2,7 +2,7 @@
 shape, F-score @ tau=0.05 + components + time, plus our gate's thin-fraction to split closed vs open
 automatically.  Writes compare/metrics_val.json (consumed by fig_charts.py)."""
 import sys, os, glob, json, time; sys.path.insert(0, "compare")
-import numpy as np, trimesh
+import numpy as np, trimesh, torch
 from core import sample_path, run_all_cloud, thin_fraction, normal_consistency, mesh_defects
 
 K = int(os.environ.get("VAL_K", "3"))                          # shapes per category
@@ -11,9 +11,15 @@ cats = sorted(os.path.basename(d) for d in glob.glob("data/ModelNet40/*") if os.
 shapes = [(c, p) for c in cats for p in sorted(glob.glob(f"data/ModelNet40/{c}/test/*.off"))[:K]]
 print(f"benchmarking {len(shapes)} shapes from {len(cats)} categories (K={K}, {N_PTS} pts)", flush=True)
 
-rows = []
+OUT = os.environ.get("OUT", "compare/metrics_val.json")
+rows, done = [], set()
+if os.environ.get("RESUME") and os.path.exists(OUT):                  # crash-safe resume of a long full-set run
+    rows = json.load(open(OUT)); done = {(r["cat"], r["file"]) for r in rows}
+    print(f"resuming with {len(done)} shapes already done", flush=True)
 t0 = time.time()
 for i, (cat, path) in enumerate(shapes):
+    if (cat, os.path.basename(path)) in done:
+        continue
     try:
         gt, P, N = sample_path(path, n=N_PTS, noise=0.0, seed=0)
         tf = thin_fraction(P, N)
@@ -44,11 +50,14 @@ for i, (cat, path) in enumerate(shapes):
                "kind": ("open" if tf > 0.30 else "closed"),
                "methods": {m: methrec(m) for m in res if m != "GT"}}
         rows.append(row)
+        if len(rows) % 25 == 0:                              # crash-safe incremental checkpoint
+            json.dump(rows, open(OUT, "w"), indent=1)
+        torch.cuda.empty_cache()                             # stop GPU memory creep over thousands of shapes
         if (i + 1) % 10 == 0 or i == 0:
             print(f"  [{i+1}/{len(shapes)}] {cat:14s} thin {tf:.2f} ({row['kind']}) | "
                   + " ".join(f"{m} F{res[m][4]:.0f}" for m in ("SPSR", "APSS", "RIMLS", "ours") if m in res)
                   + f" | {time.time()-t0:.0f}s", flush=True)
     except Exception as e:
         print(f"  skip {cat}/{os.path.basename(path)}: {e}", flush=True)
-json.dump(rows, open("compare/metrics_val.json", "w"), indent=1)
-print(f"wrote compare/metrics_val.json ({len(rows)} shapes, {time.time()-t0:.0f}s)", flush=True)
+json.dump(rows, open(OUT, "w"), indent=1)
+print(f"wrote {OUT} ({len(rows)} shapes, {time.time()-t0:.0f}s)", flush=True)

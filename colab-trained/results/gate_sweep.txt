@@ -1,0 +1,24 @@
+6 GT-labelled shapes (4 closed + 4 open categories)
+  car/car_0198.off done
+  car/car_0199.off done
+  car/car_0200.off done
+  car/car_0201.off done
+  car/car_0202.off done
+  car/car_0203.off done
+/content/wsn/compare/gate_sweep.py:56: DeprecationWarning: `trapz` is deprecated. Use `trapezoid` instead, or one of the numerical integration functions in `scipy.integrate`.
+  return float(np.trapz(np.cumsum(y) / max(P_, 1), np.cumsum(1 - y) / max(Nn_, 1)))
+
+-- gate accuracy@delta=0.30 / ROC-AUC vs point DENSITY (clean normals) --
+    256 pts:  acc 0.00   AUC 0.00
+    512 pts:  acc 0.00   AUC 0.00
+   1024 pts:  acc 0.00   AUC 0.00
+   2048 pts:  acc 0.00   AUC 0.00
+   4096 pts:  acc 0.00   AUC 0.00
+-- vs NORMAL NOISE (2048 pts) --
+  sigma 0.00:  acc 0.00   AUC 0.00
+  sigma 0.05:  acc 0.00   AUC 0.00
+  sigma 0.10:  acc 0.00   AUC 0.00
+  sigma 0.20:  acc 0.00   AUC 0.00
+
+best delta 0.05 (acc 0.00) vs hard-coded 0.30 (acc 0.00)
+wrote compare/gate_sweep.json (1440 points)

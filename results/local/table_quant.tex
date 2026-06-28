@@ -1,0 +1,19 @@
+\begin{table*}[t]\centering\footnotesize
+\begin{tabular}{lcccccccc}
+\toprule
+ & \multicolumn{2}{c}{\textbf{F-score} @ $\tau{=}0.05\;\uparrow$} & & \multicolumn{4}{c}{\textbf{mesh validity (open shells)}} & \\
+\cmidrule(lr){2-3}\cmidrule(lr){5-8}
+\textbf{method} & closed & open & \textbf{Cham}$\downarrow$ & \textbf{holes}$\downarrow$ & \textbf{self-X}$\downarrow$ & \textbf{\#comp}$\downarrow$ & \textbf{w.t.\%}$\uparrow$ & \textbf{s}$\downarrow$ \\
+\midrule
+SPSR~\cite{kazhdan2013} & $98$ & $82.1\!\pm\!0.6$ & $3.2$ & $506$ & $0$ & $35$ & $0$ & $2.8$ \\
+BPA~\cite{bernardini1999} & $100$ & $93.8\!\pm\!0.3$ & $1.6$ & $2.3k$ & $0$ & $1477$ & $0$ & $0.1$ \\
+APSS~\cite{apss} & $99$ & $83.4\!\pm\!1.4$ & $1.4$ & $8.7k$ & $54.7k$ & $1$ & $0$ & $0.6$ \\
+RIMLS~\cite{rimls} & $92$ & $64.5\!\pm\!1.9$ & $1.2$ & $8.8k$ & $61.5k$ & $1$ & $0$ & $0.9$ \\
+tori~\cite{pat} & $79$ & $83.1\!\pm\!0.5$ & $4.1$ & $286$ & $0$ & $284$ & $30$ & $18.4$ \\
+\midrule
+\textbf{ours} & $85$ & $86.9\!\pm\!0.5$ & $6.2$ & $619$ & $0$ & $569$ & $14$ & $1.9$ \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Quantitative comparison on 2468 ModelNet40 test shapes} (153 closed, 2315 open by the gate's thin-fraction).  F-score @ $\tau{=}0.05$ (\%, open shown mean$\pm95\%$CI), Chamfer-to-GT ($\times100$), and the mesh-validity metrics F-score \emph{hides}, averaged on the open shells: \textbf{holes} (boundary / hole-rim edges), \textbf{self-X} (self-intersecting faces), connected \textbf{components}, watertight fraction, runtime.  \emph{No method is clean.}  APSS and RIMLS reach a \emph{single} component yet are riddled with $\sim\!9$k hole edges and $\sim\!55$k self-intersections; BPA's high F-score is a $1.5$k-component fragment soup; SPSR over-fills open shells (low open-F).  Ours fragments ($569$ components) but is the only learned/primitive method with \emph{zero} self-intersections and an order of magnitude fewer hole edges than APSS/RIMLS, at the highest open-shell F-score among non-soup methods.  Same $4096$ oriented points; ours at $R{=}128$.}
+\label{tab:quant}
+\end{table*}

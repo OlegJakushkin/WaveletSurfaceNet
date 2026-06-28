@@ -1,0 +1,1 @@
+{"run": "colab", "model": "waveshape_mixed_v2.pt (Colab-trained, 5 epochs, best@ep2)", "val_k": 2, "measured": "locally, same 80 shapes as local/v1"}
