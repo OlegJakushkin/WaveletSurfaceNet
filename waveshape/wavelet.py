@@ -658,16 +658,19 @@ def wavelet_surface_loss(pred, clean, c_clean, target_c, seg_logits=None, seg_la
     if seg_logits is not None and seg_label is not None:
         L = L + lam_seg * F.binary_cross_entropy_with_logits(seg_logits, seg_label)
     # ---- geometry-quality block: differentiable FIELD proxies for the mesh metrics where ours is weak ----
-    # (lam_geo scales the whole block to lam_geo x the base loss above, so lam_geo=0.5 == "+50% impact").
+    # NOTE: a previous version scaled this to lam_geo x the base-loss VALUE; because the geo terms are tiny
+    # (the anchor already satisfies the anti-floater almost everywhere), that normalisation blew up the geo
+    # GRADIENT and degraded the clean field.  We now apply lam_geo as a plain FIXED weight at the terms'
+    # natural magnitude -- gentle, no gradient amplification.  Empirically the block still tends to trade clean
+    # accuracy for little gain (cf. the v2 retrain), so it is OFF by default; opt in and verify with gen_table.
     if lam_geo:
-        far = (clean.abs() >= 0.4).float()                          # CHAMFER / #COMPONENTS / SELF-X: no spurious
-        l_float = (F.relu(0.15 - pred.abs()) * far).mean()          #   zero-crossing where clean is clearly in/out (floaters)
+        far = (clean.abs() >= 0.4).float()                          # CHAMFER / #COMPONENTS: no spurious zero-crossing
+        l_float = (F.relu(0.15 - pred.abs()) * far).mean()          #   where clean is clearly in/out (floaters)
         band = (clean.abs() < 0.30).float()                         # HOLES / #COMPONENTS: de-speckle the near-surface
         l_band = ((pred - F.avg_pool3d(pred, 3, stride=1, padding=1)).abs() * band).mean()   # band (pinholes/fragments)
         interior = (clean < -0.1).float()                           # F-CLOSED: sharper interior -> crisper closed solids
         l_closed = (F.smooth_l1_loss(pred, clean, beta=0.1, reduction="none") * interior).mean()  # (open shells have none)
-        l_geo = l_float + l_band + l_closed
-        L = L + lam_geo * (L.detach() / (l_geo.detach() + 1e-6)) * l_geo
+        L = L + lam_geo * (l_float + l_band + l_closed)             # FIXED weight (no magnitude normalisation)
     return L
 
 

@@ -68,6 +68,22 @@ def sample(c, n=8000, noise=0.0, seed=0):
 
 
 # ----------------------------------------------------------------- our methods
+def _cleanup_mesh(v, f, min_faces=40, min_frac=0.005):
+    """Mesh-time hygiene for the metrics ours is weak on: drop tiny FLOATING components (spurious surface that
+    inflates #components and Chamfer).  Removes any component smaller than max(min_faces, min_frac*#faces),
+    keeps everything else (legitimate thin parts survive) and the largest if all are tiny.  Opt-in via the
+    OURS_CLEANUP env var; does NOT change default behaviour."""
+    if v is None or not len(f):
+        return v, f
+    comps = trimesh.Trimesh(v, f, process=False).split(only_watertight=False)
+    if len(comps) <= 1:
+        return v, f
+    thr = max(min_faces, min_frac * len(f))
+    keep = [c for c in comps if len(c.faces) >= thr] or [max(comps, key=lambda c: len(c.faces))]
+    m2 = trimesh.util.concatenate(keep)
+    return np.asarray(m2.vertices), np.asarray(m2.faces)
+
+
 def recon_ours(P, N):
     net = mixed_net()
     Pt = torch.tensor(P[None]).float().to(DEV); Nt = torch.tensor(N[None]).float().to(DEV)
@@ -77,7 +93,10 @@ def recon_ours(P, N):
     if not (g.min() < 0 < g.max()):
         return None, None, time.time() - t
     v, f, _, _ = measure.marching_cubes(g.astype(np.float64), 0.0)
-    return v / (g.shape[0] - 1) * (2 * BOUND) - BOUND, f, time.time() - t
+    v = v / (g.shape[0] - 1) * (2 * BOUND) - BOUND
+    if os.environ.get("OURS_CLEANUP"):
+        v, f = _cleanup_mesh(v, f)
+    return v, f, time.time() - t
 
 
 def recon_tori(P, N):

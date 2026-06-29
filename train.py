@@ -36,8 +36,12 @@ DRAWS = 2; LR = 2e-3; BASE = 40; SEED = 0; NVAL = 4; CLEAN_SAMPLE = 128
 LAM_WAVE, LAM_GRAD, LAM_SEG = 0.4, 0.05, 0.05      # target-aware wavelet term (preserves texture)
 LAM_SMOOTH, LAM_SIGN = 0.05, 0.30                  # v1 recipe (v2's boost measured WORSE on every metric -> reverted)
 LAM_CONN = 0.4
-LAM_GEO = 0.5                                       # NEW geometry-quality block at +50% of base loss: targets
-#                                                    Chamfer/floaters, #components, holes, F-closed (see wavelet_surface_loss)
+LAM_GEO = 0.2                                       # geometry-quality block ON by default at 20%: differentiable FIELD
+#                                                    proxies for the mesh metrics ours is weak on (Chamfer/floaters,
+#                                                    #components, holes, F-closed; see wavelet_surface_loss).  Applied as a
+#                                                    FIXED weight now (the magnitude-normalisation that amplified its gradient
+#                                                    is fixed) -- override with --lam-geo 0 to disable and verify any change
+#                                                    with compare/gen_table.py before trusting it.
 UDF_BAND_VOX = 0.7                                  # UDF mode: MC band in VOXELS (the field floor is ~half a voxel at any res)
 CTX_MIN, CTX_MAX = 16, 104                          # FLEXIBLE 128-token budget: the context/main split (n_ctx) is a free
                                                     # deploy-time choice; randomising it per step here teaches the net to read ANY division
