@@ -247,3 +247,4 @@ paper/*.synctex.gz
 .claude/skills/rdp-4090/
 
 paper/
+baselines_ext/scans/raw/

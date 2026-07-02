@@ -1,0 +1,56 @@
+% ============================================================ real scans
+\section{Reconstruction from real scans}\label{sec:scans}
+Every comparison so far has used clouds sampled from clean synthetic meshes with \emph{mesh-derived} normals.
+Real $3$D scans are harder in three ways at once, and all three are exactly what a reconstruction method must
+survive in the wild: they carry \emph{sensor noise} (each point is jittered off the true surface), they are
+\emph{incomplete} (self-occlusion and limited views leave holes and one-sided coverage), and --- crucially ---
+they have \emph{no normals at all}.  We therefore feed every method the same honest input: the raw scan
+vertices, centred and scaled into the $[-1,1]$ frame and farthest-point subsampled to $4096$ points, with
+per-point normals \emph{estimated} from the points themselves (a local PCA fit, oriented for global
+consistency by a minimum-spanning-tree propagation over the tangent planes, via Open3D~\cite{open3d}).  These
+estimated normals are noisier and occasionally mis-oriented where the surface is thin or sparsely sampled ---
+precisely the regime our analytic gate (\S\ref{sec:mixed}) is most sensitive to --- so this is a genuine
+stress test of the whole pipeline, anchor (\S\ref{sec:splat}) and gate included, not just of the network.
+
+\paragraph{No ground truth: a qualitative \emph{and} validity evaluation.}  A real scan has no reference
+mesh, so the F-score, Chamfer and signed-distance metrics of \S\ref{sec:baselines} are simply
+\emph{undefined} here --- there is nothing to compare against.  We do not invent a pseudo-ground-truth (e.g.\
+a Poisson mesh of the scan), which would only measure agreement with one particular baseline.  Instead the
+evaluation is twofold and both halves are GT-free: \emph{(i)} \textbf{qualitative} --- does the reconstructed
+surface look like the object, and does it degrade gracefully under real noise and occlusion rather than
+collapsing? --- and \emph{(ii)} \textbf{mesh validity}, the two defect counts that need no reference: the
+number of connected \textbf{components} (a clean object should be few; a fragment soup is many) and the number
+of \textbf{self-intersecting faces} (\textsc{self-X}), both read off the output mesh by the same
+\texttt{mesh\_defects} routine used in Table~\ref{tab:quant}.  These are reported under each panel of
+Figure~\ref{fig:cmp_scans}.
+
+\begin{figure*}[t]
+\centering\includegraphics[width=\textwidth]{figs/cmp_scans.png}
+\caption{\textbf{Reconstruction from real scans} (no ground truth; $4096$ points, \emph{estimated} normals).
+Rows are scanned objects; columns are the input point cloud, \textsc{spsr}~\cite{kazhdan2013} and
+\textsc{bpa}~\cite{bernardini1999} (Open3D~\cite{open3d}), \textsc{apss}~\cite{apss} and
+\textsc{rimls}~\cite{rimls} (PyMeshLab~\cite{pymeshlab}), and \emph{ours} (the unified mixed-base model,
+\S\ref{sec:mixed}, queried at $R{=}128$).  Because real scans have \emph{no} reference surface there is no
+F-score or Chamfer; instead each reconstructed panel prints two GT-free mesh-validity numbers --- the
+connected-component count and the self-intersecting-face count (\textsc{self-X}).  Normals are \emph{estimated}
+from the points (local PCA, globally oriented), not read from a mesh, so this also stresses the per-point gate,
+which depends on neighbouring normal directions.}
+\label{fig:cmp_scans}
+\end{figure*}
+
+\paragraph{What the scans show.}  The qualitative picture is consistent with the synthetic comparison of
+\S\ref{sec:baselines}, and the failure modes are the expected ones.  \textsc{spsr}, a watertight \emph{signed}
+Poisson solver, is the most robust to scan noise --- its global smoothing closes holes and yields a single
+clean component --- but it pays for that on \emph{open} or partially-scanned geometry, where it hallucinates a
+closed bubble over the missing back side (the over-fill of \S\ref{sec:limits}, now from real occlusion rather
+than synthetic thinness).  \textsc{bpa} hugs the measured points faithfully and so reproduces fine detail, but
+on noisy, unevenly-sampled scans it leaves boundary gaps and shatters into many components.  \textsc{apss} and
+\textsc{rimls}, the moving-least-squares surfaces, smooth the noise into a single connected blob yet carry
+heavy self-intersection (the \textsc{self-X} counts mirror Table~\ref{tab:quant}).  Ours reconstructs the
+overall body and survives the estimated, occasionally-flipped normals, routing closed regions through the
+signed base and thin/occluded regions through the unsigned band so it does not over-fill the way \textsc{spsr}
+does; its weaknesses are equally those of \S\ref{sec:baselines} --- residual floating fragments raise its
+component count, and where the estimated normals are inconsistent on a thin or sparsely-covered patch the gate
+can misfire, the failure case anticipated in \S\ref{sec:limits-gate}.  The honest reading is the same as on
+synthetic data: no method is clean on real scans, and ours is competitive --- avoiding the worst over-fill and
+self-intersection pathologies --- rather than dominant.

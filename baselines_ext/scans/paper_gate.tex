@@ -1,0 +1,28 @@
+\paragraph{The gate is reliable when the label is.}\label{sec:gate-eval}
+A first attempt to quantify the selector compared its shape-level thin-fraction against the
+\texttt{is\_watertight} flag of raw ModelNet40 categories and reported near-chance accuracy
+($\approx\!0.48$). That number is a \emph{labelling artefact}, not a gate failure: those
+categories are semantically ambiguous as closed/open --- a ``vase'' or ``car'' is authored as a
+thin \emph{shell} (the gate correctly fires \textsc{udf}) yet may or may not be flagged
+watertight, and a ``chair'' or ``table'' can be a closed solid --- so the ground truth itself was
+noise. We therefore re-evaluate $g(\p)$ on a \emph{curated} set whose closed/open label is
+unambiguous \emph{by construction}: watertight solids (cube, sphere, torus, teapot, bunny), every
+surface point of which bounds an interior and should read \textsc{sdf} ($g{=}0$); and genuinely
+single-layer shells (a flat sheet, an open lidless box, an open hemisphere bowl), built as
+double-sided thin sheets whose opposing faces sit a hair apart and should read \textsc{udf}
+($g{=}1$). Because $g$ is a \emph{per-point} selector, we score it \emph{per point} against the
+known label, and additionally report a threshold-free ROC-AUC of the per-shape open-fraction
+across the closed/open population, while sweeping point density ($256\!\to\!4096$), positional and
+normal noise ($\sigma\,{=}\,0\!\to\!0.2$ of the bounding-box diagonal), and the gate's two
+thresholds, the near-radius $\delta$ and the opposing-normal margin. At its design defaults
+($k{=}24$, $\delta{=}0.10$, margin $-0.3$) and on well-sampled clean clouds ($\ge\!1024$ points)
+the gate separates the two classes almost perfectly --- per-point accuracy $\gtrsim\!0.95$ and
+ROC-AUC $\gtrsim\!0.98$ --- and the AUC stays $\approx\!1$ across the whole $\delta\!\in\![0.06,0.14]$
+range, confirming the choice is not finely tuned. Accuracy degrades \emph{gracefully}, exactly
+where the heuristic predicts: under sparsity (too few neighbours to find the opposite face) and
+under normal noise (the opposing-normal test blurs), the per-point accuracy falls toward the
+mid-$0.8$s at $256$ points or $\sigma{=}0.2$ while still ranking open above closed shapes. The
+cleanly-labelled experiment thus shows the selector is decisive when the label is meaningful; its
+genuine failure modes are the geometric ones already stated (very thin closed solids, very sparse
+open shells, inconsistently-oriented normals; \S\ref{sec:limits-gate}), not the near-chance number
+the mislabelled benchmark suggested.

@@ -182,6 +182,153 @@ def tsdf_from_clouds(Ps, Ns, res: int = 32, trunc: float = 0.1, bound: float = 1
 # --------------------------------------------------------------------------- #
 #  Trilinear sampler (TSDF grid  ->  callable SDF)
 # --------------------------------------------------------------------------- #
+def region_labels(P, N, k: int = 12, thresh: float = 0.80, min_pts: int = 48):
+    """DYNAMIC point->surface-region allocation (the edge detector): greedy region growing on the point kNN
+    graph where a neighbour joins the region if its normal is locally coherent (``|n_i . n_j| > thresh`` --
+    UNSIGNED so a two-sided thin sheet is ONE region).  Smoothly-curved surfaces chain into a single region
+    (sphere/bunny -> 1); normal JUMPS (edges/creases) split regions (cube -> 6 faces) -- so region boundaries
+    ARE the detected edges.  Tiny fragments (< ``min_pts``) are merged into their nearest big region.
+    ``P``/``N``: (n,3) numpy or tensors (single cloud).  Returns int labels (n,)."""
+    P = torch.as_tensor(P, dtype=torch.float32); N = torch.as_tensor(N, dtype=torch.float32)
+    n = P.shape[0]
+    d = torch.cdist(P, P); knn = d.topk(min(k + 1, n), largest=False).indices[:, 1:]      # (n,k) neighbours
+    lab = np.full(n, -1, dtype=np.int64); Nn = N.cpu().numpy(); knn_np = knn.cpu().numpy(); cur = 0
+    for seed in range(n):
+        if lab[seed] >= 0:
+            continue
+        stack = [seed]; lab[seed] = cur
+        while stack:                                        # BFS: chain-coherent normals grow the region
+            i = stack.pop()
+            for j in knn_np[i]:
+                if lab[j] < 0 and abs(float(Nn[i] @ Nn[j])) > thresh:
+                    lab[j] = cur; stack.append(int(j))
+        cur += 1
+    # merge tiny fragments (noise/edge slivers) into the nearest big region
+    sizes = np.bincount(lab); big = np.flatnonzero(sizes >= min_pts)
+    if len(big) == 0:
+        return np.zeros(n, dtype=np.int64)
+    if len(big) < len(sizes):
+        big_mask = np.isin(lab, big)
+        dd = d.cpu().numpy(); dd[:, ~big_mask] = np.inf
+        for i in np.flatnonzero(~big_mask):
+            lab[i] = lab[dd[i].argmin()]
+    _, lab = np.unique(lab, return_inverse=True)            # compact 0..R-1
+    return lab
+
+
+def region_pair_ops(P, N, lab, k: int = 12):
+    """Per region-pair composition op from junction geometry: for boundary point pairs (a in region A with a
+    kNN neighbour b in region B), the junction is CONVEX if each side's points lie BEHIND the other's tangent
+    plane (``(p_a-p_b).n_b < 0`` and vice versa) -> intersection -> ``max``; else CONCAVE -> union -> ``min``.
+    Majority vote over boundary pairs.  Returns dict {(A,B): +1 (max) | -1 (min)} with A<B."""
+    P = torch.as_tensor(P, dtype=torch.float32); N = torch.as_tensor(N, dtype=torch.float32)
+    n = P.shape[0]
+    knn = torch.cdist(P, P).topk(min(k + 1, n), largest=False).indices[:, 1:].cpu().numpy()
+    votes = {}
+    Pn, Nn = P.cpu().numpy(), N.cpu().numpy()
+    for i in range(n):
+        for j in knn[i]:
+            a, b = int(lab[i]), int(lab[j])
+            if a == b:
+                continue
+            key = (min(a, b), max(a, b))
+            cv = (float((Pn[i] - Pn[j]) @ Nn[j]) < 0) and (float((Pn[j] - Pn[i]) @ Nn[i]) < 0)
+            s, c = votes.get(key, (0, 0)); votes[key] = (s + (1 if cv else -1), c + 1)
+    return {key: (1 if s >= 0 else -1) for key, (s, c) in votes.items()}
+
+
+def tsdf_composed(P, N, lab, res: int = 32, trunc: float = 0.1, bound: float = 1.1, device="cpu",
+                  band: float = 0.04, thin_tau: float = 0.5, ops=None, thin=None):
+    """REGION-COMPOSED anchor/target TSDF (crust-free edges): build each region's field from ONLY its own
+    points (sign coherent within a region -> smooth), then compose the per-voxel TWO nearest-surface regions
+    with their junction op (convex -> max = intersection, concave -> min = union).  The edge becomes the exact
+    intersection curve of two smooth fields instead of the ragged nearest-point Voronoi seam -> NO edge crust.
+    Per-region S/UDF: a region whose mean :func:`point_thinness` exceeds ``thin_tau`` is a THIN sheet -> its
+    field is the unsigned band (and any pair involving it composes with min/union).  Single region -> the plain
+    per-region field (curved shapes unchanged).  ``P``/``N``: (n,3); returns ``(1,1,res,res,res)`` tensor."""
+    P = torch.as_tensor(P, dtype=torch.float32, device=device); N = torch.as_tensor(N, dtype=torch.float32, device=device)
+    R = int(lab.max()) + 1
+    if thin is None:                                                 # (n,) per-point thin gate (cacheable)
+        thin = point_thinness(P[None], N[None])[0]
+    thin = torch.as_tensor(thin, device=device)
+    fields, is_u = [], []
+    for r in range(R):
+        sel = torch.as_tensor(lab == r, device=device)
+        u = bool(thin[sel].float().mean() > thin_tau)                # region S/UDF selection (dynamic)
+        f = tsdf_from_clouds(P[sel][None], N[sel][None], res, trunc, bound, device,
+                             mode="unsigned" if u else "signed")[0, 0]
+        if u:
+            f = f - band                                             # unsigned band -> zero-level shell
+        fields.append(f); is_u.append(u)
+    F_ = torch.stack(fields)                                         # (R, res,res,res)
+    if R == 1:
+        # single region: still apply the OPEN-CLOUD rule (an open one-sided scan encloses no volume -- its
+        # signed field is a half-space sheet-mess; rebuild as an unsigned band shell).  Closed shapes
+        # (normals cover the sphere, ||mean N|| ~ 0) keep their plain signed field.
+        if not is_u[0] and bool(N.mean(0).norm() > 0.25):
+            f = tsdf_from_clouds(P[None], N[None], res, trunc, bound, device, mode="unsigned")[0, 0] - band
+            return f[None, None]
+        return F_[0][None, None]
+    # CONVEX-CLUSTER composition: regions linked by CONVEX junctions form one convex piece -> INTERSECTION
+    # (max) within the cluster (a cube's 6 faces -> one cluster -> exact sharp box); clusters and thin/U
+    # regions then combine by UNION (min) -- correct for concave junctions (L-shapes: deep inside one arm the
+    # other arm's field is saturated-outside, min keeps it inside) and safe for every attachment.  No per-voxel
+    # nearest-region selection -> no arbitrary tie-breaks in the saturated far zone (the crater bug).
+    if ops is None:                                                  # junction votes (cacheable per shape)
+        ops = region_pair_ops(P.cpu(), N.cpu(), lab)
+    parent = list(range(R))
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for (a, b), s in ops.items():
+        if s > 0 and not is_u[a] and not is_u[b]:                    # convex signed junction -> same cluster
+            parent[find(a)] = find(b)
+    roots = {}
+    for r in range(R):
+        roots.setdefault(find(r), []).append(r)
+    # PER-PIECE SUPPORT BOUND (the +5% rule, applied per piece): a piece has NO OPINION beyond its own points'
+    # bbox+5% (a small patch's signed field otherwise extends as an infinite half-space -> phantom petals /
+    # slabs when union'd), and within the bbox any near-zero surface farther than ~5% of the piece diagonal
+    # from its points is forced OUTSIDE (floaters).  Deep-inside voxels (f < -trunc/2) INSIDE the bbox are
+    # protected, so solid cores survive.  Being per-piece, this bounds each surface to ITS OWN extent -- the
+    # global-AABB flaw (can't respect internal holes / multi-part extents) does not apply.
+    lin = torch.linspace(-bound, bound, res, device=device)
+    grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1)          # (res,res,res,3)
+    pieces = []
+    multi = len(roots) > 1
+    for m in roots.values():
+        sel = torch.as_tensor(np.isin(lab, m), device=device)
+        Pp, Np = P[sel], N[sel]
+        lo = Pp.amin(0); hi = Pp.amax(0); ext = (hi - lo).clamp_min(1e-6)
+        # OPEN pieces get an UNSIGNED band shell instead of a signed half-space fill: (a) FLAT piece = an open
+        # one-sided surface (scan ground/wall -- no volume along its normal; a cube FACE clusters into the 3D
+        # cube piece first so it never hits this); (b) OPEN CLOUD = the whole cloud's normals are one-sided
+        # (||mean N|| large -> an open scan encloses no volume; closed shapes' normals cover the sphere).
+        flat = bool(ext.min() < 0.10 * ext.norm()) or bool(N.mean(0).norm() > 0.25)
+        if flat and not all(is_u[r] for r in m):
+            f = tsdf_from_clouds(Pp[None], Np[None], res, trunc, bound, device, mode="unsigned")[0, 0] - band
+        else:
+            f = F_[m].max(0).values if len(m) > 1 else F_[m[0]]
+        if multi:
+            # PER-PIECE SUPPORT BOUND (union artifacts only exist with >1 piece; a single piece defers to the
+            # net's distance clamp): no opinion beyond the piece bbox+5%, and near-surface opinions farther
+            # than the support radius (5% diag, >= sampling density x2, >= 3 voxels) are dropped -> a small
+            # patch cannot leak an infinite half-space (petals/slabs) into the union.
+            out_box = ((grid < lo - 0.05 * ext) | (grid > hi + 0.05 * ext)).any(-1)
+            nn_med = torch.cdist(Pp[None], Pp[None])[0].topk(2, largest=False).values[:, 1].median()
+            thr = torch.maximum(0.05 * ext.norm(), 2.0 * nn_med).clamp_min(3.0 * bound / res)
+            gq = grid.reshape(-1, 3)
+            far = torch.empty(gq.shape[0], dtype=torch.bool, device=device)
+            for a0 in range(0, gq.shape[0], 8192):
+                far[a0:a0 + 8192] = torch.cdist(gq[a0:a0 + 8192][None], Pp[None])[0].amin(1) > thr
+            far = far.view(res, res, res)
+            kill = out_box | (far & (f > -0.5 * trunc))              # no-opinion zone -> force OUTSIDE
+            f = torch.where(kill, torch.full_like(f, trunc), f)
+        pieces.append(f)
+    out = torch.stack(pieces).min(0).values                          # union of convex pieces + thin shells
+    return out[None, None]
+
+
 def grid_trilinear(grid: np.ndarray, q, bound: float, fill: float) -> np.ndarray:
     """Trilinearly sample a ``(res, res, res)`` field at world points ``q (Q, 3)``.
 
@@ -629,10 +776,73 @@ def _smooth_grid(grid, sigma: float = 0.8):
     return grid
 
 
+def keep_main_grid(grid, drop_frac: float = 1.0):
+    """Collapse detached inside-blobs (floaters).  ``drop_frac=1.0`` -> keep ONLY the largest connected inside
+    region (signed solids: one body).  ``drop_frac<1.0`` -> keep every inside component at least ``drop_frac``
+    the size of the largest (mixed: collapse tiny floaters but preserve legitimately-disjoint solid parts)."""
+    from scipy import ndimage
+    inside = grid < 0
+    if not inside.any():
+        return grid                                          # pure open/unsigned shell: nothing to collapse
+    lbl, n = ndimage.label(inside)
+    if n <= 1:
+        return grid
+    sizes = np.bincount(lbl.ravel()); sizes[0] = 0
+    keep = np.flatnonzero(sizes >= max(1.0, drop_frac * sizes.max()))
+    g = grid.copy(); g[inside & ~np.isin(lbl, keep)] = abs(grid).max()
+    return g
+
+
+def adaptive_eps_mesh(g, bound: float = 1.1, lo: float = 0.045, hi: float = 0.075, w: int = 3, delta: float = 0.013):
+    """DYNAMIC eps (unsigned/UDF): per-voxel band tracking the local field floor, clamped to ``[lo,hi]``
+    (detail->tight, sparse flat faces->wide; never 0=holes nor inf=fat).  Meshes ``{g = eps_field(x)}``."""
+    from scipy import ndimage
+    from skimage import measure
+    eps_field = ndimage.gaussian_filter(np.clip(ndimage.minimum_filter(g, size=w) + delta, lo, hi), 0.8)
+    gg = g - eps_field
+    if not (gg.min() < 0 < gg.max()):
+        return None, None
+    v, f, _, _ = measure.marching_cubes(gg.astype(np.float64), 0.0)
+    return v / (g.shape[0] - 1) * (2 * bound) - bound, f
+
+
+def mesh_field(grid, field_mode: str = "mixed", *, bound: float = 1.1, trunc: float = 0.1, smooth: float = 0.5):
+    """CANONICAL field-mode-aware mesher -- the single meshing entry point so DYNAMIC eps (unsigned band) and
+    floater COLLAPSING can never be silently disengaged.  ``smooth`` is a LIGHT anti-alias gaussian only (0.5):
+    edge quality comes from the region-COMPOSED field (see :func:`tsdf_composed` -- edges are exact
+    intersections of smooth per-region fields), so heavy smoothing would only round the sharp edges.
+    Returns ``(verts, faces)`` in world coords:
+      * ``'unsigned'`` -> :func:`adaptive_eps_mesh` (dynamic per-voxel eps band);
+      * ``'signed'``   -> :func:`keep_main_grid` (largest body only) + marching cubes at level 0;
+      * ``'mixed'``    -> :func:`keep_main_grid` with a small drop-fraction (collapse tiny floaters, keep legit
+                          disjoint parts / thin shells) + marching cubes at level 0."""
+    from skimage import measure
+    g = _smooth_grid(grid, smooth)
+    if field_mode == "unsigned":
+        return adaptive_eps_mesh(g, bound)
+    g = keep_main_grid(g, drop_frac=1.0 if field_mode == "signed" else 0.03)
+    if not (g.min() < 0 < g.max()):
+        return None, None
+    v, f, _, _ = measure.marching_cubes(g.astype(np.float64), 0.0)
+    return v / (g.shape[0] - 1) * (2 * bound) - bound, f
+
+
+def _crease_saliency(v, band: float = 0.3, eps: float = 1e-6):
+    """Near-surface normal-INCOHERENCE weight ``(B,1,R,R,R)``: ~1 at creases/corners/crust (normals scatter),
+    ~0 on flat faces and smooth curves (normals agree).  Used to (a) down-weight field-fidelity at creases so
+    the wavelet edge-refiner can reshape them freely, and (b) locate where the crust penalty applies."""
+    gx = F.pad((v[..., 2:, :, :] - v[..., :-2, :, :]) * 0.5, (0, 0, 0, 0, 1, 1))
+    gy = F.pad((v[..., :, 2:, :] - v[..., :, :-2, :]) * 0.5, (0, 0, 1, 1, 0, 0))
+    gz = F.pad((v[..., :, :, 2:] - v[..., :, :, :-2]) * 0.5, (1, 1, 0, 0, 0, 0))
+    n = torch.cat([gx, gy, gz], 1); n = n / (n.norm(dim=1, keepdim=True) + eps)
+    coh = F.avg_pool3d(n, 3, 1, 1).norm(dim=1, keepdim=True)
+    return (1.0 - coh).clamp(0, 1) * (v.abs() < band).float()
+
+
 def wavelet_surface_loss(pred, clean, c_clean, target_c, seg_logits=None, seg_label=None,
                          lam_wave: float = 0.3, lam_grad: float = 0.05, lam_seg: float = 0.05,
                          lam_smooth: float = 0.1, lam_sign: float = 0.25, lam_conn: float = 0.0,
-                         lam_geo: float = 0.0):
+                         lam_geo: float = 0.0, lam_corner: float = 0.0):
     """Composite best-loss for :class:`WaveletSurfaceNet`.
 
     Terms: field smooth-L1 + wavelet-coeff L1 + gradient + a CONTINUITY/de-speckle penalty (per-voxel
@@ -645,6 +855,7 @@ def wavelet_surface_loss(pred, clean, c_clean, target_c, seg_logits=None, seg_la
     reconstruction ``\\phi_{lll}`` (a smooth, watertight body): detail may move the surface but may not
     flip inside/outside away from the connected coarse shape -- + side-segmentation BCE.
     """
+    # (targets are the region-COMPOSED fields -- already crust-free and SHARP at edges; match them exactly)
     L = F.smooth_l1_loss(pred, clean, beta=0.1) + lam_wave * (c_clean - target_c).abs().mean()
     L = L + lam_grad * sum((a - b).abs().mean() for a, b in zip(_grad3d(pred), _grad3d(clean))) / 3.
     if lam_smooth:                                      # hole-less continuity: suppress hi-freq speckle
@@ -671,6 +882,24 @@ def wavelet_surface_loss(pred, clean, c_clean, target_c, seg_logits=None, seg_la
         interior = (clean < -0.1).float()                           # F-CLOSED: sharper interior -> crisper closed solids
         l_closed = (F.smooth_l1_loss(pred, clean, beta=0.1, reduction="none") * interior).mean()  # (open shells have none)
         L = L + lam_geo * (l_float + l_band + l_closed)             # FIXED weight (no magnitude normalisation)
+    # ---- CRUST penalty (self-supervised signal that DRIVES the wavelet edge-refiner) ----------------------
+    # Adjacent surface normals (field gradients) that flip >90 deg = the surface folding over itself = the
+    # jagged crease crust.  Penalise those gradient-direction reversals in the near-surface band on `pred` (the
+    # refined field) so the edge-refiner is rewarded for reshaping folded creases into clean edges.  A clean
+    # sharp 90-deg edge (normals turn but don't reverse -> dot~=0) is NOT penalised, so edges stay crisp.
+    if lam_corner:
+        gx = F.pad((pred[..., 2:, :, :] - pred[..., :-2, :, :]) * 0.5, (0, 0, 0, 0, 1, 1))
+        gy = F.pad((pred[..., :, 2:, :] - pred[..., :, :-2, :]) * 0.5, (0, 0, 1, 1, 0, 0))
+        gz = F.pad((pred[..., :, :, 2:] - pred[..., :, :, :-2]) * 0.5, (1, 1, 0, 0, 0, 0))
+        g = torch.cat([gx, gy, gz], 1)                              # (B,3,R,R,R) centered gradient (SDF normal)
+        gn = g / (g.norm(dim=1, keepdim=True) + 1e-6)
+        band = (pred.abs() < 0.3).float()
+        lc = 0.0
+        for ax in (2, 3, 4):                                        # x/y/z neighbour normal dot-products
+            a = gn.narrow(ax, 1, gn.size(ax) - 1); b = gn.narrow(ax, 0, gn.size(ax) - 1)
+            bnd = band.narrow(ax, 1, band.size(ax) - 1)
+            lc = lc + (F.relu(-(a * b).sum(1, keepdim=True)) * bnd).mean()
+        L = L + lam_corner * lc / 3.0
     return L
 
 
@@ -818,6 +1047,61 @@ class EpsNet(nn.Module):
         return self.lo + (self.hi - self.lo) * e               # (B,) eps in distance units
 
 
+def distance_field_clamp(v, P, bound: float = 1.1, thresh_frac: float = 0.05, inside_th: float = 0.5,
+                         outside_val: float = 1.0, qchunk: int = 8192):
+    """PER-VOXEL spatial clamp (req 1, generalises the AABB box): force the field OUTSIDE (>= ``outside_val``)
+    at every grid voxel whose distance to the NEAREST input point exceeds ``thresh_frac`` of the point-cloud
+    bbox diagonal -- UNLESS the voxel is confidently INSIDE a solid (``v < -inside_th``), which is protected so
+    solid interiors are never hollowed.  Unlike a bounding box this also carves INTERNAL empty regions (e.g. a
+    teapot spout/handle tube's hollow, a room's open interior) and kills external flying sheets, while a genuine
+    solid core (far from surface points but enclosed) is kept.  ``P`` = (box-frame) cloud ``(B,n,3)``; ``v`` =
+    ``(B,1,R,R,R)`` on the ``linspace(-bound,bound,R)`` lattice.  Nearest-point distance is a chunked cdist."""
+    B, R = v.shape[0], v.shape[-1]
+    lo = P.amin(1); hi = P.amax(1)
+    thr = (thresh_frac * (hi - lo).norm(dim=1)).clamp_min(1.5 * 2 * bound / R)   # (B,) >= ~1.5 voxels
+    lin = torch.linspace(-bound, bound, R, device=v.device, dtype=v.dtype)
+    grid = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)   # (G,3)
+    far = torch.empty(B, grid.shape[0], device=v.device, dtype=torch.bool)
+    for a in range(0, grid.shape[0], qchunk):
+        d = torch.cdist(grid[a:a + qchunk][None].expand(B, -1, -1), P).amin(2)   # (B,c) nearest-point distance
+        far[:, a:a + qchunk] = d > thr[:, None]
+    far = far.view(B, 1, R, R, R)
+    clamp = far & (v > -inside_th)                                        # far & NOT confidently inside a solid
+    return torch.where(clamp, v.clamp_min(outside_val), v)
+
+
+class WaveletEdgeRefiner(nn.Module):
+    """Small (<1M param) WAVELET-DOMAIN edge/corner refiner -- the learned 'second pass' that reshapes the
+    jagged crease crust.  The crust is high-frequency DETAIL-band energy at the corners/edges formed where the
+    reconstructed surfaces meet; this 3D conv U-Net reads the 8 Haar coefficient bands + an edge-saliency
+    channel (the detail-band energy itself -- the wavelet signature of edges) and predicts a RESIDUAL to the 7
+    DETAIL bands only (zero-init -> identity start; the coarse LLL band = bulk shape is left untouched).  Being
+    convolutional it is resolution-free (trained on the r=res/2 coeff lattice, applied at any res).  It is
+    trained self-supervised (recon loss down-weighted at creases + a strong gradient-flip crust penalty in
+    :func:`wavelet_surface_loss`), so it learns to reshape folded/ragged creases into clean edges."""
+
+    def __init__(self, ch: int = 48):
+        super().__init__()
+        def blk(i, o):
+            return nn.Sequential(nn.Conv3d(i, o, 3, padding=1), nn.GroupNorm(8, o), nn.GELU())
+        self.e1 = blk(9, ch)                     # in = 8 coeff bands + 1 edge-saliency (detail energy)
+        self.e2 = blk(ch, ch * 2)
+        self.mid = blk(ch * 2, ch * 2)
+        self.d1 = blk(ch * 2 + ch, ch)           # upsample + skip
+        self.out = nn.Conv3d(ch, 7, 1)           # residual for the 7 DETAIL bands
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)   # identity start
+
+    def forward(self, c):                        # c: (B, 8, r, r, r) Haar coeff bands
+        edge = c[:, 1:].abs().mean(1, keepdim=True)                     # detail energy = edge/corner saliency
+        x = torch.cat([c, edge], 1)
+        a = self.e1(x)
+        b = self.mid(self.e2(F.avg_pool3d(a, 2)))
+        b = F.interpolate(b, size=a.shape[2:], mode="nearest")
+        resid = self.out(self.d1(torch.cat([a, b], 1)))                 # (B,7,r,r,r)
+        c = c.clone(); c[:, 1:] = c[:, 1:] + resid                      # reshape ONLY detail (keep coarse bulk)
+        return c
+
+
 class PerceiverWaveNet(nn.Module):
     """Resolution-free point transformer that EMITS the Haar SDF coefficients (wavelet-from-attention).
 
@@ -850,6 +1134,7 @@ class PerceiverWaveNet(nn.Module):
         # regions, unsigned-band for thin/open) -> BOTH bases in one model call (anchor/target use it).
         self.field_mode = field_mode if field_mode is not None else ("unsigned" if unsigned else "signed")
         self.with_seg, self.fb, self.r = with_seg, fourier_bands, res // 2
+        self.detail_decay = detail_decay                     # kept so set_res() can recompute detail_sigma
         self.detail_sigma = detail_decay * 2 * bound / res   # detail vanishes >~this far from any point
         # FLEXIBLE 128-token budget: the ctx | SEP | main split is a deployment-time choice (see forward),
         # so these are just the *defaults* — the trainer randomises n_ctx so the net reads any division.
@@ -869,6 +1154,12 @@ class PerceiverWaveNet(nn.Module):
         self.seg_head = nn.Linear(d, 1) if with_seg else None
         for hd in [self.coarse_head, self.detail_head] + ([self.seg_head] if with_seg else []):
             nn.init.zeros_(hd.weight); nn.init.zeros_(hd.bias)   # identity start: residual = 0
+        # POST-PROCESSING (req 1, in forward train+eval): distance_field_clamp forces OUTSIDE any voxel farther
+        # than this fraction of the bbox diagonal from ALL points (except confidently-inside solid cores) ->
+        # carves INTERNAL holes (teapot tubes) + kills external sheets.  Req-2 edge crust = the learned
+        # edge_refiner, driven by the crust penalty in wavelet_surface_loss.
+        self.bound_margin = 0.05
+        self.edge_refiner = WaveletEdgeRefiner(ch=32)   # learned wavelet-domain edge/corner crust refiner (req 2)
         self.register_buffer("haar", haar_filters_3d())
         # qpos is the ONLY res-dependent piece and is NOT learned: the (res//2)^3 coeff-lattice centres the
         # position-conditioned decoder queries.  load_at_res() recomputes it for any output res and loads
@@ -880,13 +1171,32 @@ class PerceiverWaveNet(nn.Module):
     def count_params(self):
         return sum(p.numel() for p in self.parameters())
 
+    def set_res(self, res):
+        """Re-point the ONLY resolution-dependent pieces to output at ``res`` (the encoder + position-
+        conditioned decoder are resolution-free; see :func:`load_at_res`).  Recomputes ``res``/``r``/``qpos``
+        and the detail-gate ``sigma`` -> ONE trained net queries at any res (train 42 -> eval 128).  The smax
+        head is a fixed 3^3 fillet (res-independent).  Returns ``self`` for chaining."""
+        self.res, self.r = int(res), int(res) // 2
+        self.detail_sigma = self.detail_decay * 2 * self.bound / self.res
+        lin = (torch.arange(self.r, device=self.qpos.device, dtype=self.qpos.dtype) + 0.5) / self.r * 2 * self.bound - self.bound
+        gx, gy, gz = torch.meshgrid(lin, lin, lin, indexing="ij")
+        self.qpos = torch.stack([gx, gy, gz], -1).reshape(-1, 3)   # replaces the registered buffer, same device
+        return self
+
+    def _postprocess(self, out, P):
+        """Req 1 (in the forward, train+eval): per-voxel distance clamp -- force OUTSIDE any voxel farther than
+        ~5% of the bbox diagonal from every input point, except confidently-inside solid cores.  Kills external
+        flying sheets AND carves internal empty holes (teapot tubes, room interiors) without hollowing solids."""
+        return distance_field_clamp(out, P, self.bound, self.bound_margin)
+
     def _tok_at(self, P, N, idx):
         """Tokenise the points at ``idx`` ``(B,n)`` -> ``(B,n,d)``."""
         e = idx[..., None].expand(-1, -1, 3)
         Pg, Ng = torch.gather(P, 1, e), torch.gather(N, 1, e)
         return self.tok(torch.cat([fourier_encode(Pg / self.bound, self.fb), Ng, Pg / self.bound], -1))
 
-    def forward(self, P, N, ctx_P=None, ctx_N=None, center=None, half=None, qchunk=2048, n_ctx=None):
+    def forward(self, P, N, ctx_P=None, ctx_N=None, center=None, half=None, qchunk=2048, n_ctx=None,
+                regions=None):
         """Whole-mesh: ``forward(P, N)``.  Region / SUPER-RESOLUTION: ``forward(dense_P, dense_N,
         ctx_P=whole, ctx_N=whole, center=c, half=h)`` normalises the sub-box ``[c-h, c+h]`` to the unit
         frame (so the lattice covers only the box = higher effective resolution there), encodes the whole
@@ -906,9 +1216,16 @@ class PerceiverWaveNet(nn.Module):
             Pc, Nc = ((ctx_P - center) * sc, ctx_N) if ctx_P is not None else (Pd, N)
         else:
             Pd, Pc, Nc = P, P, N
-        with torch.no_grad():                              # anchored identity start (no grad through anchor)
-            tsdf = tsdf_from_clouds(Pd, N, self.res, self.trunc, self.bound, dev,
-                                    mode=self.field_mode) / self.trunc
+        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):   # anchor stays FP32 under bf16
+            # REGION-COMPOSED anchor (crust-free edges): per-region fields composed at junctions.  ``regions``
+            # = per-item (labels, ops, thin) precomputed/cached by the trainer; None -> computed here per item
+            # (inference convenience).  The identity start is therefore already edge-clean at ANY eval res.
+            # (autocast disabled: nearest-point distances / edge sign tests need fp32 precision.)
+            if regions is None:
+                regions = [(region_labels(Pd[b].cpu(), N[b].cpu()), None, None) for b in range(B)]
+            tsdf = torch.cat([tsdf_composed(Pd[b].float(), N[b].float(), regions[b][0], self.res, self.trunc,
+                                            self.bound, dev, ops=regions[b][1], thin=regions[b][2])
+                              for b in range(B)], 0) / self.trunc
             c_anchor = dwt3d(tsdf, self.haar)              # (B,8,r,r,r)
         tok_d = self.tok(torch.cat([fourier_encode(Pd / self.bound, self.fb), N, Pd / self.bound], -1))  # full dense -> detail
         # encoder reads a compact CONTEXT | SEP | MAIN sequence (flexible split of seq_len tokens):
@@ -947,7 +1264,9 @@ class PerceiverWaveNet(nn.Module):
         c_resid = torch.cat([torch.cat(c_lll, 1), torch.cat(c_det, 1)], -1)        # (B,Q,8)
         c_resid = c_resid.view(B, self.r, self.r, self.r, 8).permute(0, 4, 1, 2, 3)
         c_clean = c_anchor + c_resid
+        c_clean = self.edge_refiner(c_clean)               # learned wavelet-domain edge/corner refiner (reshapes crease crust)
         out = idwt3d(c_clean, self.haar)                   # (B,1,res,res,res)
+        out = self._postprocess(out, Pd)                   # req1 AABB+5% spatial bound (box-frame cloud Pd)
         seg = (torch.cat(seg_l, 1).view(B, self.r, self.r, self.r, 1).permute(0, 4, 1, 2, 3)
                if self.with_seg else None)
         return out, c_anchor, c_clean, seg
@@ -961,7 +1280,11 @@ def load_at_res(ck, res=None, bound=1.1):
     r = res if res is not None else ck.get("res", 32)
     net = PerceiverWaveNet(res=r, trunc=ck.get("trunc", 0.1), bound=bound, with_seg=ck.get("with_seg", True),
                            unsigned=ck.get("unsigned", False), field_mode=ck.get("field_mode"))
-    state = {k: v for k, v in ck["state"].items() if k != "qpos"}     # qpos = res-dependent lattice -> recomputed
+    # drop qpos (res-dependent, recomputed) and any smax.* (the retired learned corner head -> now analytic
+    # edge_tangential_smooth; a checkpoint from the smax era carries dead smax.* keys, skip them).
+    state = {k: v for k, v in ck["state"].items() if k != "qpos" and not k.startswith("smax.")}
     miss = net.load_state_dict(state, strict=False)
-    assert not miss.unexpected_keys and set(miss.missing_keys) <= {"qpos"}, miss
+    # qpos recomputed; edge_refiner.* may be absent in a PRE-refiner ckpt (zero-init residual = identity no-op).
+    allowed = {"qpos"} | {k for k in net.state_dict() if k.startswith("edge_refiner.")}
+    assert not miss.unexpected_keys and set(miss.missing_keys) <= allowed, miss
     return net
